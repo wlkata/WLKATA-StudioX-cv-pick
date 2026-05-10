@@ -1,0 +1,87 @@
+<div class="cvpick">
+  <div class="cvpick-left">
+    <div id="cvpick-feed-wrap" class="cvpick-feed-wrap">
+      <img id="cvpick-feed" class="cvpick-feed" alt="Camera feed" />
+      <div id="cvpick-placeholder" class="cvpick-placeholder">
+        <p>Starting camera&hellip;</p>
+      </div>
+      <div id="cvpick-roi-overlay" class="cvpick-roi-overlay">
+        <div id="cvpick-roi-rect" class="cvpick-roi-rect">
+          <div class="cvpick-roi-handle" data-corner="tl"></div>
+          <div class="cvpick-roi-handle" data-corner="tr"></div>
+          <div class="cvpick-roi-handle" data-corner="bl"></div>
+          <div class="cvpick-roi-handle" data-corner="br"></div>
+          <div class="cvpick-roi-edge" data-edge="t"></div>
+          <div class="cvpick-roi-edge" data-edge="b"></div>
+          <div class="cvpick-roi-edge" data-edge="l"></div>
+          <div class="cvpick-roi-edge" data-edge="r"></div>
+        </div>
+      </div>
+    </div>
+    <div class="cvpick-toolbar">
+      <div class="cvpick-toolbar-row">
+        <select id="cvpick-camera-select" class="cvpick-select" title="Camera"></select>
+        <select id="cvpick-resolution-select" class="cvpick-select" title="Resolution"></select>
+      </div>
+      <div class="cvpick-toolbar-row">
+        <div class="cvpick-mode-toggle">
+          <button id="cvpick-mode-color" class="cvpick-mode-btn active">Color</button>
+          <button id="cvpick-mode-shape" class="cvpick-mode-btn">Shape</button>
+        </div>
+        <div class="cvpick-phase-toggle">
+          <button id="cvpick-phase-learn" class="cvpick-phase-btn active">Learn</button>
+          <button id="cvpick-phase-detect" class="cvpick-phase-btn">Detect</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="cvpick-right">
+    <div id="cvpick-learn-controls" class="cvpick-controls">
+      <input id="cvpick-name" type="text" placeholder="Name (optional)" />
+      <div class="cvpick-btn-row">
+        <button id="cvpick-learn-btn" class="cvpick-btn-primary">Learn</button>
+        <button id="cvpick-clear-btn" class="cvpick-btn-secondary">Clear All</button>
+      </div>
+    </div>
+    <div class="cvpick-section">
+      <h3 class="cvpick-section-title">Learned Items</h3>
+      <div id="cvpick-learned-list">
+        <p class="cvpick-empty">No items learned yet. Place an object in the zone and click Learn.</p>
+      </div>
+    </div>
+
+    <div class="cvpick-section cvpick-calib-section">
+      <h3 class="cvpick-section-title">Calibration</h3>
+      <p class="cvpick-calib-hint">Map camera pixels to robot coordinates using two reference points.</p>
+
+      <button id="cvpick-calib-detect" class="cvpick-btn-primary cvpick-calib-detect-btn">Detect Markers</button>
+
+      <div class="cvpick-calib-points">
+        <div class="cvpick-calib-point">
+          <div class="cvpick-calib-point-header">
+            <span class="cvpick-calib-label">Point A</span>
+            <span id="cvpick-calib-px-a" class="cvpick-calib-value">—</span>
+          </div>
+          <div class="cvpick-calib-robot-row">
+            <span id="cvpick-calib-robot-a" class="cvpick-calib-value">—</span>
+            <button id="cvpick-calib-record-a" class="cvpick-btn-secondary cvpick-calib-record-btn" disabled>Record A</button>
+          </div>
+        </div>
+        <div class="cvpick-calib-point">
+          <div class="cvpick-calib-point-header">
+            <span class="cvpick-calib-label">Point B</span>
+            <span id="cvpick-calib-px-b" class="cvpick-calib-value">—</span>
+          </div>
+          <div class="cvpick-calib-robot-row">
+            <span id="cvpick-calib-robot-b" class="cvpick-calib-value">—</span>
+            <button id="cvpick-calib-record-b" class="cvpick-btn-secondary cvpick-calib-record-btn" disabled>Record B</button>
+          </div>
+        </div>
+      </div>
+
+      <button id="cvpick-calib-save" class="cvpick-btn-primary" disabled>Calibrate</button>
+      <div id="cvpick-calib-status" class="cvpick-calib-status">Not calibrated</div>
+    </div>
+  </div>
+</div>

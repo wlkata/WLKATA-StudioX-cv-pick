@@ -1,0 +1,19 @@
+{
+  "name": "cv-pick",
+  "displayName": "CV Pick",
+  "version": "1.0.0",
+  "description": "Learn colors and shapes, then detect them in real-time with bounding boxes.",
+  "contributes": {
+    "sidebarTab": {
+      "id": "cv-pick",
+      "label": "CV Pick",
+      "icon": "frontend/icon.svg",
+      "html": "frontend/tab.html",
+      "js": "frontend/tab.js",
+      "css": "frontend/tab.css"
+    },
+    "backend": {
+      "main": "backend/main.py"
+    }
+  }
+}

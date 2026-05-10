@@ -1,0 +1,365 @@
+/* CV Pick — all selectors scoped under .cvpick */
+
+.cvpick {
+  display: flex;
+  gap: 16px;
+  height: 100%;
+  padding: 16px;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+/* ---- two-column layout ---- */
+.cvpick-left {
+  flex: 3;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.cvpick-right {
+  flex: 2;
+  min-width: 180px;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+.cvpick-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+  flex-shrink: 0;
+}
+.cvpick-toolbar-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.cvpick-select {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--border-primary, #ccc);
+  border-radius: 6px;
+  background: var(--bg-secondary, #f5f5f5);
+  color: var(--text-primary, #333);
+  font-size: 12px;
+  cursor: pointer;
+  outline: none;
+}
+.cvpick-select:focus {
+  border-color: var(--accent, #2196F3);
+}
+
+/* mode toggle (pill buttons) */
+.cvpick-mode-toggle {
+  display: flex;
+  border: 1px solid var(--border-primary, #ccc);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.cvpick-mode-btn {
+  padding: 5px 14px;
+  border: none;
+  background: var(--bg-secondary, #f5f5f5);
+  color: var(--text-primary, #333);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.cvpick-mode-btn + .cvpick-mode-btn {
+  border-left: 1px solid var(--border-primary, #ccc);
+}
+.cvpick-mode-btn.active {
+  background: var(--accent, #2196F3);
+  color: #fff;
+}
+
+/* phase toggle (Learn / Detect) */
+.cvpick-phase-toggle {
+  display: flex;
+  border: 1px solid var(--border-primary, #ccc);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.cvpick-phase-btn {
+  padding: 5px 14px;
+  border: none;
+  background: var(--bg-secondary, #f5f5f5);
+  color: var(--text-primary, #333);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.cvpick-phase-btn + .cvpick-phase-btn {
+  border-left: 1px solid var(--border-primary, #ccc);
+}
+.cvpick-phase-btn.active {
+  background: #43a047;
+  color: #fff;
+}
+
+/* ---- camera feed ---- */
+.cvpick-feed-wrap {
+  position: relative;
+  width: 100%;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.cvpick-feed {
+  display: none;
+  width: 100%;
+}
+
+/* ---- ROI overlay ---- */
+.cvpick-roi-overlay {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  pointer-events: none;
+}
+.cvpick-roi-rect {
+  position: absolute;
+  border: 2px solid rgba(0, 255, 255, 0.85);
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.3);
+  pointer-events: all;
+  cursor: move;
+}
+.cvpick-roi-rect::before,
+.cvpick-roi-rect::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  background: rgba(0, 255, 255, 0.6);
+  pointer-events: none;
+}
+.cvpick-roi-rect::before {
+  width: 20px;
+  height: 1px;
+  transform: translate(-50%, -50%);
+}
+.cvpick-roi-rect::after {
+  width: 1px;
+  height: 20px;
+  transform: translate(-50%, -50%);
+}
+.cvpick-roi-handle {
+  position: absolute;
+  width: 14px; height: 14px;
+  background: rgba(0, 255, 255, 0.9);
+  border: 1px solid rgba(0, 100, 100, 0.6);
+  border-radius: 2px;
+  pointer-events: all;
+  z-index: 2;
+}
+.cvpick-roi-handle[data-corner="tl"] { top: -7px; left: -7px; cursor: nw-resize; }
+.cvpick-roi-handle[data-corner="tr"] { top: -7px; right: -7px; cursor: ne-resize; }
+.cvpick-roi-handle[data-corner="bl"] { bottom: -7px; left: -7px; cursor: sw-resize; }
+.cvpick-roi-handle[data-corner="br"] { bottom: -7px; right: -7px; cursor: se-resize; }
+
+.cvpick-roi-edge {
+  position: absolute;
+  pointer-events: all;
+  z-index: 1;
+}
+.cvpick-roi-edge[data-edge="t"] { top: -4px; left: 7px; right: 7px; height: 8px; cursor: n-resize; }
+.cvpick-roi-edge[data-edge="b"] { bottom: -4px; left: 7px; right: 7px; height: 8px; cursor: s-resize; }
+.cvpick-roi-edge[data-edge="l"] { left: -4px; top: 7px; bottom: 7px; width: 8px; cursor: w-resize; }
+.cvpick-roi-edge[data-edge="r"] { right: -4px; top: 7px; bottom: 7px; width: 8px; cursor: e-resize; }
+
+.cvpick-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 180px;
+  color: var(--text-muted, #999);
+  font-size: 13px;
+}
+.cvpick-placeholder p { margin: 0; }
+
+/* ---- controls ---- */
+.cvpick-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.cvpick-btn-row {
+  display: flex;
+  gap: 8px;
+}
+.cvpick-btn-row .cvpick-btn-primary { flex: 1; }
+.cvpick-btn-row .cvpick-btn-secondary { flex: 1; }
+.cvpick-controls input {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--border-primary, #ccc);
+  border-radius: 6px;
+  background: var(--bg-primary, #fff);
+  color: var(--text-primary, #333);
+  font-size: 13px;
+  outline: none;
+}
+.cvpick-controls input:focus {
+  border-color: var(--accent, #2196F3);
+}
+.cvpick-btn-primary {
+  padding: 7px 16px;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent, #2196F3);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.cvpick-btn-primary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.cvpick-btn-secondary {
+  padding: 7px 14px;
+  border: 1px solid var(--border-primary, #ccc);
+  border-radius: 6px;
+  background: var(--bg-secondary, #f5f5f5);
+  color: var(--text-primary, #333);
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+/* ---- learned-items section ---- */
+.cvpick-section {
+  margin-top: 16px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.cvpick-section-title {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary, #666);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.cvpick-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border-primary, #eee);
+}
+.cvpick-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.cvpick-item-name {
+  flex: 1;
+  font-size: 13px;
+  color: var(--text-primary, #333);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvpick-item-mode {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--bg-tertiary, #eee);
+  color: var(--text-secondary, #666);
+  text-transform: uppercase;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.cvpick-item-rm {
+  border: none;
+  background: none;
+  color: var(--text-muted, #aaa);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+  flex-shrink: 0;
+}
+.cvpick-item-rm:hover {
+  color: #e53935;
+}
+.cvpick-empty {
+  font-size: 12px;
+  color: var(--text-muted, #999);
+  text-align: center;
+  padding: 16px 0;
+  margin: 0;
+}
+
+/* ---- calibration section ---- */
+.cvpick-calib-section {
+  border-top: 1px solid var(--border-primary, #eee);
+  padding-top: 12px;
+}
+.cvpick-calib-hint {
+  font-size: 11px;
+  color: var(--text-muted, #999);
+  margin: 0 0 8px;
+  line-height: 1.4;
+}
+.cvpick-calib-detect-btn {
+  width: 100%;
+  margin-bottom: 10px;
+}
+.cvpick-calib-points {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.cvpick-calib-point {
+  background: var(--bg-secondary, #f5f5f5);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.cvpick-calib-point-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+.cvpick-calib-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary, #333);
+}
+.cvpick-calib-value {
+  font-size: 11px;
+  color: var(--text-secondary, #666);
+  font-family: monospace;
+}
+.cvpick-calib-robot-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+}
+.cvpick-calib-record-btn {
+  padding: 3px 10px;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+.cvpick-calib-status {
+  margin-top: 8px;
+  font-size: 11px;
+  text-align: center;
+  color: var(--text-muted, #999);
+}
+.cvpick-calib-status.calibrated {
+  color: #43a047;
+  font-weight: 600;
+}
