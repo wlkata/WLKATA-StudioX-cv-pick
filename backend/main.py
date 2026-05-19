@@ -623,32 +623,40 @@ class _CVState:
     # -- calibration -------------------------------------------------------
 
     def set_calibration(self, pixel_pts, robot_pts, z_height):
-        """Compute and store a 2D similarity transform from 2 point pairs.
+        """Compute and store a 2D affine transform from 3 point pairs.
 
-        pixel_pts: [[px1,py1], [px2,py2]]
-        robot_pts: [[rx1,ry1], [rx2,ry2]]
+        pixel_pts: [[px1,py1], [px2,py2], [px3,py3]]
+        robot_pts: [[rx1,ry1], [rx2,ry2], [rx3,ry3]]
         z_height:  float (robot Z for picking)
-        """
-        px1, py1 = float(pixel_pts[0][0]), float(pixel_pts[0][1])
-        px2, py2 = float(pixel_pts[1][0]), float(pixel_pts[1][1])
-        rx1, ry1 = float(robot_pts[0][0]), float(robot_pts[0][1])
-        rx2, ry2 = float(robot_pts[1][0]), float(robot_pts[1][1])
 
-        # Solve:  a*px - b*py + tx = rx
-        #         b*px + a*py + ty = ry   (for both point pairs)
+        Affine:  robot_x = a*px + b*py + tx
+                 robot_y = c*px + d*py + ty
+        """
+        P = [[float(p[0]), float(p[1])] for p in pixel_pts]
+        R = [[float(r[0]), float(r[1])] for r in robot_pts]
+
+        # 6 equations, 6 unknowns: [a, b, tx, c, d, ty]
         A = np.array([
-            [px1, -py1, 1, 0],
-            [py1,  px1, 0, 1],
-            [px2, -py2, 1, 0],
-            [py2,  px2, 0, 1],
+            [P[0][0], P[0][1], 1, 0, 0, 0],
+            [0, 0, 0, P[0][0], P[0][1], 1],
+            [P[1][0], P[1][1], 1, 0, 0, 0],
+            [0, 0, 0, P[1][0], P[1][1], 1],
+            [P[2][0], P[2][1], 1, 0, 0, 0],
+            [0, 0, 0, P[2][0], P[2][1], 1],
         ], dtype=np.float64)
-        B = np.array([rx1, ry1, rx2, ry2], dtype=np.float64)
+        B = np.array([
+            R[0][0], R[0][1],
+            R[1][0], R[1][1],
+            R[2][0], R[2][1],
+        ], dtype=np.float64)
 
         params = np.linalg.solve(A, B)
-        a, b, tx, ty = params.tolist()
+        a, b, tx, c, d, ty = params.tolist()
 
         self.calibration = {
-            "a": a, "b": b, "tx": tx, "ty": ty, "z": float(z_height),
+            "a": a, "b": b, "tx": tx,
+            "c": c, "d": d, "ty": ty,
+            "z": float(z_height),
         }
         return self.calibration
 
@@ -656,10 +664,10 @@ class _CVState:
         """Convert pixel coords to robot coords using stored calibration."""
         if not self.calibration:
             return None
-        c = self.calibration
-        rx = c["a"] * px - c["b"] * py + c["tx"]
-        ry = c["b"] * px + c["a"] * py + c["ty"]
-        return {"x": round(rx, 2), "y": round(ry, 2), "z": round(c["z"], 2)}
+        cal = self.calibration
+        rx = cal["a"] * px + cal["b"] * py + cal["tx"]
+        ry = cal["c"] * px + cal["d"] * py + cal["ty"]
+        return {"x": round(rx, 2), "y": round(ry, 2), "z": round(cal["z"], 2)}
 
 
 _state = _CVState()
@@ -890,15 +898,15 @@ def calibration():
     z = data.get("z")
 
     if (not pixel_pts or not robot_pts
-            or len(pixel_pts) != 2 or len(robot_pts) != 2 or z is None):
+            or len(pixel_pts) != 3 or len(robot_pts) != 3 or z is None):
         return jsonify({"success": False,
-                        "error": "Need pixel_points (2), robot_points (2), z"})
+                        "error": "Need pixel_points (3), robot_points (3), z"})
     try:
         cal = _state.set_calibration(pixel_pts, robot_pts, float(z))
         return jsonify({"success": True, "calibration": cal})
     except np.linalg.LinAlgError:
         return jsonify({"success": False,
-                        "error": "Points are collinear — choose two distinct positions"})
+                        "error": "Points are collinear — place markers in an L-shape"})
 
 
 @blueprint.route("/pick-position", methods=["POST"])
