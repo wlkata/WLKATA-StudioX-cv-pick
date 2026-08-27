@@ -1,0 +1,156 @@
+{
+  "id": "cv_pick",
+  "name": "CV Pick",
+  "description": "Capture an image, detect coin-like circles (pixel centers), map them to robot XYZ with the CV Pick affine calibration (a,b,tx,c,d,ty + z), then pick at each pose. Use extension saved functions detect_coins / map_to_robot / pick_at (capture is user-defined).",
+  "version": "1.2.0",
+  "imports": [],
+  "context": [
+    {
+      "name": "robot",
+      "type": "Robot",
+      "blockly": "robot_var",
+      "required": true
+    },
+    {
+      "name": "a",
+      "type": "Number",
+      "blockly": "number",
+      "default": 1,
+      "required": true
+    },
+    {
+      "name": "b",
+      "type": "Number",
+      "blockly": "number",
+      "default": 0,
+      "required": true
+    },
+    {
+      "name": "tx",
+      "type": "Number",
+      "blockly": "number",
+      "default": 0,
+      "required": true
+    },
+    {
+      "name": "c",
+      "type": "Number",
+      "blockly": "number",
+      "default": 0,
+      "required": true
+    },
+    {
+      "name": "d",
+      "type": "Number",
+      "blockly": "number",
+      "default": 1,
+      "required": true
+    },
+    {
+      "name": "ty",
+      "type": "Number",
+      "blockly": "number",
+      "default": 0,
+      "required": true
+    },
+    {
+      "name": "z",
+      "type": "Number",
+      "blockly": "number",
+      "default": 0,
+      "required": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "capture",
+      "label": "Capture image",
+      "pattern": "single",
+      "inputs": [],
+      "output": { "name": "image", "type": "Image" },
+      "slot": {
+        "required": true,
+        "signature": {
+          "params": [],
+          "returns": "Image"
+        },
+        "placeholderLabel": "Choose capture function…"
+      }
+    },
+    {
+      "id": "detect",
+      "label": "Detect coins (circles)",
+      "pattern": "single",
+      "inputs": [
+        { "name": "image", "from": "image" }
+      ],
+      "output": { "name": "image_positions", "type": "List" },
+      "slot": {
+        "required": true,
+        "signature": {
+          "params": [
+            { "name": "image", "type": "Image" }
+          ],
+          "returns": "List"
+        },
+        "placeholderLabel": "Choose detect function… (e.g. detect_coins)"
+      }
+    },
+    {
+      "id": "map_to_robot",
+      "label": "Map pixel → robot (affine cal)",
+      "pattern": "single",
+      "inputs": [
+        { "name": "image_positions", "from": "image_positions" },
+        { "name": "a", "from": "context.a" },
+        { "name": "b", "from": "context.b" },
+        { "name": "tx", "from": "context.tx" },
+        { "name": "c", "from": "context.c" },
+        { "name": "d", "from": "context.d" },
+        { "name": "ty", "from": "context.ty" },
+        { "name": "z", "from": "context.z" }
+      ],
+      "output": { "name": "robot_positions", "type": "List" },
+      "slot": {
+        "required": true,
+        "signature": {
+          "params": [
+            { "name": "image_positions", "type": "List" },
+            { "name": "a", "type": "Number" },
+            { "name": "b", "type": "Number" },
+            { "name": "tx", "type": "Number" },
+            { "name": "c", "type": "Number" },
+            { "name": "d", "type": "Number" },
+            { "name": "ty", "type": "Number" },
+            { "name": "z", "type": "Number" }
+          ],
+          "returns": "List"
+        },
+        "placeholderLabel": "Choose mapping function… (e.g. map_to_robot)"
+      }
+    },
+    {
+      "id": "pick",
+      "label": "Pick at each robot position",
+      "pattern": "list_iter",
+      "iterOver": "robot_positions",
+      "itemName": "pose",
+      "inputs": [
+        { "name": "robot", "from": "context.robot" },
+        { "name": "pose", "from": "iter.pose" }
+      ],
+      "output": null,
+      "slot": {
+        "required": true,
+        "signature": {
+          "params": [
+            { "name": "robot", "type": "Robot" },
+            { "name": "pose", "type": "Any" }
+          ],
+          "returns": "void"
+        },
+        "placeholderLabel": "Choose pick function… (e.g. pick_at)"
+      }
+    }
+  ]
+}
