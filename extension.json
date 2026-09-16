@@ -3,6 +3,7 @@
   "displayName": "CV Pick",
   "version": "1.0.0",
   "description": "Learn colors and shapes, then detect them in real-time with bounding boxes. Includes a Blockly CV Pick workflow (capture → detect → map → pick).",
+  "permissions": ["camera"],
   "contributes": {
     "sidebarTab": {
       "id": "cv-pick",
