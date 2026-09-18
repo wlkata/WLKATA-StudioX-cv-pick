@@ -44,7 +44,24 @@ _PALETTE = [
 #  Camera enumeration (friendly names when the OS provides them)
 # ---------------------------------------------------------------------------
 
-def _open_capture(index):
+def _is_windows():
+    return platform.system() == "Windows"
+
+
+def _configure_size(cap, width, height):
+    """Apply size (and MJPG on Windows so UVC can leave 640x480)."""
+    if cap is None or not width or not height or width <= 0 or height <= 0:
+        return
+    if _is_windows():
+        try:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        except Exception:
+            pass
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+
+
+def _open_capture(index, width=None, height=None):
     """Open a capture with the platform backend that matches name order."""
     system = platform.system()
     backends = []
@@ -55,9 +72,13 @@ def _open_capture(index):
     for be in backends:
         cap = cv2.VideoCapture(index, be)
         if cap.isOpened():
+            if width and height:
+                _configure_size(cap, width, height)
             return cap
         cap.release()
     cap = cv2.VideoCapture(index)
+    if cap.isOpened() and width and height:
+        _configure_size(cap, width, height)
     return cap
 
 
@@ -616,7 +637,9 @@ class _CVState:
         with self.lock:
             self._pending_resolution = req
             self._last_resolution_ok = True
-        self._resolution_event.wait(timeout=6.0)
+        # Windows reopen can take several seconds.
+        wait_s = 12.0 if _is_windows() else 6.0
+        self._resolution_event.wait(timeout=wait_s)
         with self.lock:
             cw, ch = self._last_resolution
             ok = self._last_resolution_ok
@@ -652,14 +675,61 @@ class _CVState:
             f = self._raw_frame
             return f.copy() if f is not None else None
 
+    def _swap_camera(self, cap):
+        """Replace the live capture; caller owns the new *cap*."""
+        old = self.camera
+        self.camera = cap
+        if old is not None:
+            try:
+                old.release()
+            except Exception:
+                pass
+
+    def _reopen_at(self, width, height):
+        """
+        Release and reopen this camera at (width, height).
+        Returns measured (w, h) or None.
+        """
+        idx = self._camera_index
+        old = self.camera
+        self.camera = None
+        if old is not None:
+            try:
+                old.release()
+            except Exception:
+                pass
+        cap = _open_capture(idx, width, height)
+        if cap is None or not cap.isOpened():
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            return None
+        size = _read_frame_size(cap, tries=15)
+        if not size or size[0] <= 0 or size[1] <= 0:
+            try:
+                cap.release()
+            except Exception:
+                pass
+            return None
+        self.camera = cap
+        return size
+
     def _restore_resolution(self, prev):
-        """Best-effort restore of a known-good mode; returns (w,h) or (0,0)."""
-        if not prev or prev[0] <= 0 or prev[1] <= 0 or self.camera is None:
+        """Restore a known-good mode. Windows always reopens."""
+        if not prev or prev[0] <= 0 or prev[1] <= 0:
             return (0, 0)
-        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, prev[0])
-        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, prev[1])
+        if _is_windows():
+            return self._reopen_at(prev[0], prev[1]) or (0, 0)
+        if self.camera is None:
+            return self._reopen_at(prev[0], prev[1]) or (0, 0)
+        _configure_size(self.camera, prev[0], prev[1])
         size = _read_frame_size(self.camera, tries=12)
-        return size or (0, 0)
+        if size and size[0] > 0:
+            return size
+        # In-place set left the handle dead — reopen.
+        return self._reopen_at(prev[0], prev[1]) or (0, 0)
 
     def _apply_pending_resolution(self):
         """Run only on the capture thread."""
@@ -667,29 +737,36 @@ class _CVState:
             pending = self._pending_resolution
             self._pending_resolution = None
             prev = tuple(self._last_resolution)
-        if not pending or self.camera is None:
+        if not pending:
             return
         w, h = pending
         reverted = False
         try:
-            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-            self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-            size = _read_frame_size(self.camera, tries=12)
+            if _is_windows():
+                # DirectShow/MSMF: set() on a live handle often kills read().
+                size = self._reopen_at(w, h)
+            else:
+                if self.camera is None:
+                    size = self._reopen_at(w, h)
+                else:
+                    _configure_size(self.camera, w, h)
+                    size = _read_frame_size(self.camera, tries=12)
+                    if not size or size[0] <= 0:
+                        size = self._reopen_at(w, h)
+
             if size and _resolution_matches((w, h), size):
                 aw, ah = size
             elif size and size[0] > 0 and size[1] > 0:
-                # Driver gave a stable alternate size — accept only if it was
-                # already in the supported list; otherwise treat as failure.
+                # Driver opened at a different real size — keep it if known.
                 if any(_resolution_matches(size, s) for s in self._supported_resolutions):
                     aw, ah = size
                 else:
                     restored = self._restore_resolution(prev)
-                    aw, ah = restored if restored[0] > 0 else prev
+                    aw, ah = restored if restored and restored[0] > 0 else prev
                     reverted = True
             else:
-                # No frames — restore previous mode so the stream unfreezes.
                 restored = self._restore_resolution(prev)
-                aw, ah = restored if restored[0] > 0 else prev
+                aw, ah = restored if restored and restored[0] > 0 else prev
                 reverted = True
             if aw <= 0 or ah <= 0:
                 aw, ah = prev if prev[0] > 0 else (w, h)
@@ -697,6 +774,13 @@ class _CVState:
             with self.lock:
                 self._last_resolution = (int(aw), int(ah))
                 self._last_resolution_ok = not reverted
+        except Exception:
+            restored = self._restore_resolution(prev)
+            aw, ah = restored if restored and restored[0] > 0 else prev
+            with self.lock:
+                if aw > 0 and ah > 0:
+                    self._last_resolution = (int(aw), int(ah))
+                self._last_resolution_ok = False
         finally:
             self._resolution_event.set()
 
@@ -707,7 +791,11 @@ class _CVState:
         while self.running:
             t0 = time.monotonic()
             self._apply_pending_resolution()
-            ret, frame = self.camera.read()
+            cap = self.camera
+            if cap is None:
+                time.sleep(0.02)
+                continue
+            ret, frame = cap.read()
             if not ret:
                 time.sleep(0.01)
                 continue

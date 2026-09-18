@@ -494,6 +494,9 @@
     if (!reqW || !reqH) return;
     var fallbackKey = lastGoodResKey;
 
+    setCameraBusy(true);
+    setPlaceholder('Loading camera\u2026', true);
+
     ExtensionAPI.fetch('cv-pick', '/resolution', {
       method: 'POST',
       body: JSON.stringify({ width: reqW, height: reqH })
@@ -507,10 +510,20 @@
         }
       } else if (fallbackKey && resSelect.querySelector('option[value="' + fallbackKey + '"]')) {
         resSelect.value = fallbackKey;
+        lastGoodResKey = fallbackKey;
+      }
+      setCameraBusy(false);
+      if (cameraRunning && polling) {
+        showLiveFeed();
       }
     }).catch(function () {
       if (fallbackKey && resSelect.querySelector('option[value="' + fallbackKey + '"]')) {
         resSelect.value = fallbackKey;
+        lastGoodResKey = fallbackKey;
+      }
+      setCameraBusy(false);
+      if (cameraRunning && polling) {
+        showLiveFeed();
       }
     });
   });
