@@ -147,33 +147,148 @@ def _platform_camera_names():
     return []
 
 
-def enumerate_cameras(max_probe=10, skip_index=None):
-    """
-    Return [{index, name}, ...]. Prefer OS device names; fall back to probing
-    indices 0..max_probe-1 as "Camera N".
+def _read_frame_size(cap, tries=8):
+    """Return (w, h) from a real frame, or None if the device produces nothing."""
+    for _ in range(tries):
+        ret, frame = cap.read()
+        if ret and frame is not None and getattr(frame, "size", 0):
+            h, w = int(frame.shape[0]), int(frame.shape[1])
+            if w > 0 and h > 0:
+                return (w, h)
+    return None
 
-    skip_index: if set, treat that index as available without re-opening
-    (used when that camera is already held by the capture thread).
+
+def _resolution_matches(requested, actual, tol=0.02):
+    rw, rh = requested
+    aw, ah = actual
+    if aw <= 0 or ah <= 0 or rw <= 0 or rh <= 0:
+        return False
+    return (
+        abs(aw - rw) <= max(2, int(rw * tol))
+        and abs(ah - rh) <= max(2, int(rh * tol))
+    )
+
+
+def _try_resolution(cap, w, h):
+    """
+    Ask the driver for (w, h) and verify a frame actually arrives at that size.
+    Returns the measured (aw, ah) on success, else None.
+    """
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(w))
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(h))
+    size = _read_frame_size(cap, tries=10)
+    if not size:
+        return None
+    if _resolution_matches((w, h), size):
+        return size
+    return None
+
+
+def probe_camera_resolutions(cap):
+    """
+    Test candidate resolutions by capturing frames.
+    Returns ([(w,h), ...], default_(w,h)) or ([], None) if unusable.
+    """
+    found = {}
+
+    baseline = _read_frame_size(cap, tries=10)
+    if baseline:
+        found[baseline] = True
+
+    for w, h in _CANDIDATE_RESOLUTIONS:
+        got = _try_resolution(cap, w, h)
+        if got:
+            found[got] = True
+
+    if not found:
+        return [], None
+
+    res_list = sorted(found.keys(), key=lambda wh: (wh[0] * wh[1], wh[0]))
+    default = res_list[0]
+    for preferred in ((640, 480), (1280, 720), (800, 600), (1280, 960)):
+        for cand in res_list:
+            if _resolution_matches(preferred, cand):
+                default = cand
+                break
+        else:
+            continue
+        break
+
+    # Leave the device parked on a known-good mode.
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, default[0])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, default[1])
+    _read_frame_size(cap, tries=6)
+    return res_list, default
+
+
+def test_camera_device(index, name=None):
+    """
+    Open *index*, verify it can deliver frames, probe resolutions.
+    Returns a catalog entry or None if the camera is unusable.
+    """
+    cap = _open_capture(int(index))
+    if cap is None or not cap.isOpened():
+        if cap is not None:
+            cap.release()
+        return None
+    try:
+        res_list, default = probe_camera_resolutions(cap)
+        if not res_list or not default:
+            return None
+        label = (name or "").strip() or f"Camera {index}"
+        return {
+            "index": int(index),
+            "name": label,
+            "resolutions": [{"width": w, "height": h} for w, h in res_list],
+            "default": {"width": default[0], "height": default[1]},
+        }
+    except Exception:
+        return None
+    finally:
+        try:
+            cap.release()
+        except Exception:
+            pass
+
+
+# Last full catalog from /cameras (index -> entry). Used by start().
+_device_catalog = {}
+_device_catalog_lock = threading.Lock()
+
+
+def enumerate_cameras(max_probe=10, skip_index=None, skip_entry=None):
+    """
+    Return usable cameras only: each must produce frames at ≥1 resolution.
+
+    skip_index / skip_entry: camera already held by the live session — do not
+    re-open it; reuse the running session's probed list instead.
     """
     names = _platform_camera_names()
     if names:
-        return [
-            {"index": i, "name": (n.strip() if n and str(n).strip() else f"Camera {i}")}
+        candidates = [
+            (i, (n.strip() if n and str(n).strip() else f"Camera {i}"))
             for i, n in enumerate(names)
         ]
+    else:
+        candidates = [(i, f"Camera {i}") for i in range(max_probe)]
 
     out = []
-    for i in range(max_probe):
-        if skip_index is not None and i == skip_index:
-            out.append({"index": i, "name": f"Camera {i}"})
+    for i, name in candidates:
+        if skip_index is not None and i == int(skip_index):
+            if skip_entry and skip_entry.get("resolutions"):
+                entry = dict(skip_entry)
+                entry["index"] = i
+                entry["name"] = entry.get("name") or name
+                out.append(entry)
             continue
-        cap = _open_capture(i)
-        try:
-            if cap is not None and cap.isOpened():
-                out.append({"index": i, "name": f"Camera {i}"})
-        finally:
-            if cap is not None:
-                cap.release()
+        info = test_camera_device(i, name)
+        if info:
+            out.append(info)
+
+    with _device_catalog_lock:
+        _device_catalog.clear()
+        for entry in out:
+            _device_catalog[int(entry["index"])] = entry
     return out
 
 
@@ -402,6 +517,8 @@ class _CVState:
         self._pending_resolution = None  # (w, h) or None
         self._resolution_event = threading.Event()
         self._last_resolution = (0, 0)
+        self._last_resolution_ok = True  # False if last change was reverted
+        self._camera_name = ""
 
     # -- camera lifecycle --------------------------------------------------
 
@@ -410,51 +527,104 @@ class _CVState:
             if self._camera_index == camera_index:
                 return True
             self.stop()
-        cap = _open_capture(int(camera_index))
+
+        idx = int(camera_index)
+        with _device_catalog_lock:
+            cached = dict(_device_catalog.get(idx) or {})
+
+        cap = _open_capture(idx)
         if cap is None or not cap.isOpened():
             if cap is not None:
                 cap.release()
             return False
+
+        # Prefer catalog probe from /cameras; re-test if missing.
+        res_list = []
+        default = None
+        if cached.get("resolutions"):
+            res_list = [
+                (int(r["width"]), int(r["height"]))
+                for r in cached["resolutions"]
+                if int(r.get("width") or 0) > 0 and int(r.get("height") or 0) > 0
+            ]
+            d = cached.get("default") or {}
+            if int(d.get("width") or 0) > 0 and int(d.get("height") or 0) > 0:
+                default = (int(d["width"]), int(d["height"]))
+        if not res_list or not default:
+            res_list, default = probe_camera_resolutions(cap)
+        if not res_list or not default:
+            cap.release()
+            return False
+
+        # Park on default and confirm a frame before starting the loop.
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, default[0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, default[1])
+        size = _read_frame_size(cap, tries=12)
+        if not size:
+            cap.release()
+            return False
+
         self.camera = cap
-        self._camera_index = int(camera_index)
+        self._camera_index = idx
+        self._camera_name = cached.get("name") or f"Camera {idx}"
+        self._supported_resolutions = sorted(set(res_list) | {size})
+        self._last_resolution = size
+        self._last_resolution_ok = True
         self._pending_resolution = None
         self._resolution_event.set()
-        self._probe_resolutions(cap)
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self._last_resolution = (w, h)
         self.running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         return True
 
-    def _probe_resolutions(self, cap):
-        """Probe which resolutions the camera actually accepts."""
-        orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        seen = {(orig_w, orig_h)}
-        for w, h in _CANDIDATE_RESOLUTIONS:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-            aw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            ah = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            if aw == w and ah == h:
-                seen.add((w, h))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, orig_w)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, orig_h)
-        self._supported_resolutions = sorted(seen)
+    def catalog_entry(self):
+        """Snapshot of the live camera for /cameras while it is held open."""
+        with self.lock:
+            res = [
+                {"width": w, "height": h}
+                for w, h in self._supported_resolutions
+                if w > 0 and h > 0
+            ]
+            lw, lh = self._last_resolution
+        if not res:
+            return None
+        default = {"width": lw, "height": lh} if lw > 0 and lh > 0 else res[0]
+        return {
+            "index": self._camera_index,
+            "name": self._camera_name or f"Camera {self._camera_index}",
+            "resolutions": res,
+            "default": default,
+        }
 
     def request_resolution(self, width, height):
-        """Queue a resolution change for the capture thread. Returns (w, h)."""
+        """
+        Queue a resolution change for the capture thread.
+        Returns dict {width, height, reverted} or None.
+        """
         if self.camera is None or not self.running:
             return None
+        req = (int(width), int(height))
+        # Reject modes we already know are unsupported.
+        with self.lock:
+            supported = list(self._supported_resolutions)
+        if supported and not any(_resolution_matches(req, s) for s in supported):
+            with self.lock:
+                cw, ch = self._last_resolution
+            return {"width": cw, "height": ch, "reverted": True}
+
         self._resolution_event.clear()
         with self.lock:
-            self._pending_resolution = (int(width), int(height))
-        # Wait for the capture thread to apply it (or time out).
-        self._resolution_event.wait(timeout=5.0)
+            self._pending_resolution = req
+            self._last_resolution_ok = True
+        self._resolution_event.wait(timeout=6.0)
         with self.lock:
-            return tuple(self._last_resolution)
+            cw, ch = self._last_resolution
+            ok = self._last_resolution_ok
+        return {
+            "width": cw,
+            "height": ch,
+            "reverted": (not ok) or (not _resolution_matches(req, (cw, ch))),
+        }
 
     def stop(self):
         self.running = False
@@ -482,6 +652,15 @@ class _CVState:
             f = self._raw_frame
             return f.copy() if f is not None else None
 
+    def _restore_resolution(self, prev):
+        """Best-effort restore of a known-good mode; returns (w,h) or (0,0)."""
+        if not prev or prev[0] <= 0 or prev[1] <= 0 or self.camera is None:
+            return (0, 0)
+        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, prev[0])
+        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, prev[1])
+        size = _read_frame_size(self.camera, tries=12)
+        return size or (0, 0)
+
     def _apply_pending_resolution(self):
         """Run only on the capture thread."""
         with self.lock:
@@ -491,31 +670,33 @@ class _CVState:
         if not pending or self.camera is None:
             return
         w, h = pending
+        reverted = False
         try:
             self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, w)
             self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-            # Prefer real frame shape — CAP_PROP often returns -1 after set().
-            aw = ah = 0
-            for _ in range(12):
-                ret, frame = self.camera.read()
-                if ret and frame is not None and getattr(frame, "size", 0):
-                    ah, aw = int(frame.shape[0]), int(frame.shape[1])
-                    if aw > 0 and ah > 0:
-                        break
+            size = _read_frame_size(self.camera, tries=12)
+            if size and _resolution_matches((w, h), size):
+                aw, ah = size
+            elif size and size[0] > 0 and size[1] > 0:
+                # Driver gave a stable alternate size — accept only if it was
+                # already in the supported list; otherwise treat as failure.
+                if any(_resolution_matches(size, s) for s in self._supported_resolutions):
+                    aw, ah = size
+                else:
+                    restored = self._restore_resolution(prev)
+                    aw, ah = restored if restored[0] > 0 else prev
+                    reverted = True
+            else:
+                # No frames — restore previous mode so the stream unfreezes.
+                restored = self._restore_resolution(prev)
+                aw, ah = restored if restored[0] > 0 else prev
+                reverted = True
             if aw <= 0 or ah <= 0:
-                pw = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-                ph = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-                if pw > 0 and ph > 0:
-                    aw, ah = pw, ph
-            if aw <= 0 or ah <= 0:
-                # Keep previous known-good size rather than reporting -1x-1.
-                aw, ah = prev if prev[0] > 0 and prev[1] > 0 else (w, h)
+                aw, ah = prev if prev[0] > 0 else (w, h)
+                reverted = True
             with self.lock:
-                self._last_resolution = (aw, ah)
-                if (aw, ah) not in self._supported_resolutions:
-                    self._supported_resolutions = sorted(
-                        set(self._supported_resolutions) | {(aw, ah)}
-                    )
+                self._last_resolution = (int(aw), int(ah))
+                self._last_resolution_ok = not reverted
         finally:
             self._resolution_event.set()
 
@@ -939,9 +1120,15 @@ def stop_camera():
 
 @blueprint.route("/cameras")
 def list_cameras():
-    """List cameras as [{index, name}, ...] with friendly OS names when possible."""
+    """
+    List only cameras that can deliver frames, each with tested resolutions.
+    Entry shape: {index, name, resolutions:[{width,height}], default:{width,height}}
+    """
     skip = _state._camera_index if _state.running else None
-    cameras = enumerate_cameras(max_probe=10, skip_index=skip)
+    skip_entry = _state.catalog_entry() if _state.running else None
+    cameras = enumerate_cameras(
+        max_probe=10, skip_index=skip, skip_entry=skip_entry,
+    )
     return jsonify({
         "success": True,
         "cameras": cameras,
@@ -966,20 +1153,27 @@ def resolution():
     applied = _state.request_resolution(int(w), int(h))
     if not applied:
         return jsonify({"success": False, "error": "Camera not running"})
-    aw, ah = applied
-    return jsonify({"success": True, "width": aw, "height": ah})
+    return jsonify({
+        "success": True,
+        "width": applied["width"],
+        "height": applied["height"],
+        "reverted": bool(applied.get("reverted")),
+    })
 
 
 @blueprint.route("/resolutions")
 def list_resolutions():
-    """Return the camera's supported resolutions (probed on start)."""
+    """Return the camera's frame-tested resolutions."""
     with _state.lock:
         w, h = _state._last_resolution
-        res_list = list(_state._supported_resolutions)
+        res_list = [
+            (rw, rh) for rw, rh in _state._supported_resolutions
+            if rw > 0 and rh > 0
+        ]
     return jsonify({
         "success": True,
         "resolutions": [{"width": rw, "height": rh} for rw, rh in res_list],
-        "current": {"width": w, "height": h},
+        "current": {"width": w, "height": h} if w > 0 and h > 0 else None,
     })
 
 

@@ -227,6 +227,10 @@
 
   var cameraBusy = false;
   var cameraRunning = false;
+  /** index -> { resolutions:[{width,height}], default:{width,height} } */
+  var cameraMeta = {};
+  /** Last confirmed live resolution key, e.g. "1280x720". */
+  var lastGoodResKey = '';
 
   /**
    * Show the full-area cover over the feed (hides ROI / blank frame).
@@ -278,12 +282,20 @@
   function populateCameras(data) {
     if (!data || !data.success || !cameraSelect) return;
     var prev = cameraSelect.value;
+    cameraMeta = {};
     cameraSelect.innerHTML = '';
     (data.cameras || []).forEach(function (cam) {
       var idx = (cam && typeof cam === 'object') ? cam.index : cam;
       var name = (cam && typeof cam === 'object' && cam.name)
         ? cam.name
         : ('Camera ' + idx);
+      // Backend already drops cameras with no working resolution.
+      if (cam && typeof cam === 'object') {
+        cameraMeta[String(idx)] = {
+          resolutions: Array.isArray(cam.resolutions) ? cam.resolutions : [],
+          default: cam.default || null
+        };
+      }
       var opt = document.createElement('option');
       opt.value = String(idx);
       opt.textContent = name;
@@ -317,26 +329,44 @@
       resSelect.appendChild(opt);
     }
     resSelect.value = key;
+    lastGoodResKey = key;
   }
 
-  function loadResolutions() {
+  function fillResolutionSelect(resolutions, current) {
+    if (!resSelect) return;
+    resSelect.innerHTML = '';
+    (resolutions || []).forEach(function (r) {
+      var w = parseInt(r.width, 10);
+      var h = parseInt(r.height, 10);
+      if (!w || !h || w < 0 || h < 0) return;
+      var opt = document.createElement('option');
+      opt.value = w + 'x' + h;
+      opt.textContent = w + 'x' + h;
+      resSelect.appendChild(opt);
+    });
+    if (current && current.width > 0 && current.height > 0) {
+      selectResolution(current.width, current.height);
+    } else if (resSelect.options.length) {
+      resSelect.selectedIndex = 0;
+    }
+  }
+
+  /** Prefer frame-tested list from /cameras catalog; fall back to /resolutions. */
+  function loadResolutions(camIdx) {
+    var meta = cameraMeta[String(camIdx)];
+    if (meta && meta.resolutions && meta.resolutions.length) {
+      fillResolutionSelect(meta.resolutions, meta.default);
+      // Sync current from backend if live.
+      ExtensionAPI.fetch('cv-pick', '/resolutions').then(function (data) {
+        if (data && data.success && data.current && data.current.width > 0) {
+          selectResolution(data.current.width, data.current.height);
+        }
+      }).catch(function () {});
+      return;
+    }
     ExtensionAPI.fetch('cv-pick', '/resolutions').then(function (data) {
       if (!data.success) return;
-      var prev = resSelect.value;
-      resSelect.innerHTML = '';
-      data.resolutions.forEach(function (r) {
-        var opt = document.createElement('option');
-        opt.value = r.width + 'x' + r.height;
-        opt.textContent = r.width + 'x' + r.height;
-        resSelect.appendChild(opt);
-      });
-      if (data.current && data.current.width && data.current.height) {
-        selectResolution(data.current.width, data.current.height);
-      } else if (prev && resSelect.querySelector('option[value="' + prev + '"]')) {
-        resSelect.value = prev;
-      } else if (resSelect.options.length) {
-        resSelect.selectedIndex = 0;
-      }
+      fillResolutionSelect(data.resolutions, data.current);
     }).catch(function () {});
   }
 
@@ -398,7 +428,7 @@
       return waitForFirstFrame().then(function (ok) {
         if (ok) {
           cameraRunning = true;
-          loadResolutions();
+          loadResolutions(idx);
           updateStartBtn();
           // Clear busy before starting the poll loop — pollFrame() no-ops
           // while cameraBusy is true, which froze the feed on frame 1.
@@ -462,20 +492,25 @@
     var reqW = parseInt(parts[0], 10);
     var reqH = parseInt(parts[1], 10);
     if (!reqW || !reqH) return;
-    // Keep the requested value selected while applying; then snap to actual.
-    var requestedKey = reqW + 'x' + reqH;
+    var fallbackKey = lastGoodResKey;
+
     ExtensionAPI.fetch('cv-pick', '/resolution', {
       method: 'POST',
       body: JSON.stringify({ width: reqW, height: reqH })
     }).then(function (data) {
       if (data && data.success && data.width > 0 && data.height > 0) {
         selectResolution(data.width, data.height);
-      } else if (resSelect.querySelector('option[value="' + requestedKey + '"]')) {
-        resSelect.value = requestedKey;
+        if (data.reverted) {
+          ExtensionAPI.showNotification(
+            'That resolution is not usable; kept ' + data.width + 'x' + data.height,
+            'error');
+        }
+      } else if (fallbackKey && resSelect.querySelector('option[value="' + fallbackKey + '"]')) {
+        resSelect.value = fallbackKey;
       }
     }).catch(function () {
-      if (resSelect.querySelector('option[value="' + requestedKey + '"]')) {
-        resSelect.value = requestedKey;
+      if (fallbackKey && resSelect.querySelector('option[value="' + fallbackKey + '"]')) {
+        resSelect.value = fallbackKey;
       }
     });
   });
