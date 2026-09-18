@@ -398,6 +398,10 @@ class _CVState:
         self._raw_frame = None
         self._processed_frame = None
         self.calibration = None  # {a, b, tx, ty, z} similarity transform
+        # Applied only on the capture thread (never call cap.set from HTTP).
+        self._pending_resolution = None  # (w, h) or None
+        self._resolution_event = threading.Event()
+        self._last_resolution = (0, 0)
 
     # -- camera lifecycle --------------------------------------------------
 
@@ -413,7 +417,12 @@ class _CVState:
             return False
         self.camera = cap
         self._camera_index = int(camera_index)
+        self._pending_resolution = None
+        self._resolution_event.set()
         self._probe_resolutions(cap)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self._last_resolution = (w, h)
         self.running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -435,8 +444,21 @@ class _CVState:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, orig_h)
         self._supported_resolutions = sorted(seen)
 
+    def request_resolution(self, width, height):
+        """Queue a resolution change for the capture thread. Returns (w, h)."""
+        if self.camera is None or not self.running:
+            return None
+        self._resolution_event.clear()
+        with self.lock:
+            self._pending_resolution = (int(width), int(height))
+        # Wait for the capture thread to apply it (or time out).
+        self._resolution_event.wait(timeout=5.0)
+        with self.lock:
+            return tuple(self._last_resolution)
+
     def stop(self):
         self.running = False
+        self._resolution_event.set()
         if self._thread:
             self._thread.join(timeout=3)
             self._thread = None
@@ -446,6 +468,7 @@ class _CVState:
         with self.lock:
             self._raw_frame = None
             self._processed_frame = None
+            self._pending_resolution = None
 
     # -- thread-safe frame access ------------------------------------------
 
@@ -459,12 +482,50 @@ class _CVState:
             f = self._raw_frame
             return f.copy() if f is not None else None
 
+    def _apply_pending_resolution(self):
+        """Run only on the capture thread."""
+        with self.lock:
+            pending = self._pending_resolution
+            self._pending_resolution = None
+            prev = tuple(self._last_resolution)
+        if not pending or self.camera is None:
+            return
+        w, h = pending
+        try:
+            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+            self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+            # Prefer real frame shape — CAP_PROP often returns -1 after set().
+            aw = ah = 0
+            for _ in range(12):
+                ret, frame = self.camera.read()
+                if ret and frame is not None and getattr(frame, "size", 0):
+                    ah, aw = int(frame.shape[0]), int(frame.shape[1])
+                    if aw > 0 and ah > 0:
+                        break
+            if aw <= 0 or ah <= 0:
+                pw = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                ph = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                if pw > 0 and ph > 0:
+                    aw, ah = pw, ph
+            if aw <= 0 or ah <= 0:
+                # Keep previous known-good size rather than reporting -1x-1.
+                aw, ah = prev if prev[0] > 0 and prev[1] > 0 else (w, h)
+            with self.lock:
+                self._last_resolution = (aw, ah)
+                if (aw, ah) not in self._supported_resolutions:
+                    self._supported_resolutions = sorted(
+                        set(self._supported_resolutions) | {(aw, ah)}
+                    )
+        finally:
+            self._resolution_event.set()
+
     # -- capture + process loop --------------------------------------------
 
     def _loop(self):
         target_dt = 1.0 / 30
         while self.running:
             t0 = time.monotonic()
+            self._apply_pending_resolution()
             ret, frame = self.camera.read()
             if not ret:
                 time.sleep(0.01)
@@ -890,35 +951,34 @@ def list_cameras():
 
 @blueprint.route("/resolution", methods=["GET", "POST"])
 def resolution():
-    if _state.camera is None or not _state.camera.isOpened():
+    if _state.camera is None or not _state.running:
         return jsonify({"success": False, "error": "Camera not running"})
     if request.method == "GET":
-        w = int(_state.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(_state.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        with _state.lock:
+            w, h = _state._last_resolution
         return jsonify({"success": True, "width": w, "height": h})
     data = request.get_json() or {}
     w = data.get("width")
     h = data.get("height")
     if not w or not h:
         return jsonify({"success": False, "error": "Need width and height"})
-    _state.camera.set(cv2.CAP_PROP_FRAME_WIDTH, int(w))
-    _state.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, int(h))
-    aw = int(_state.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
-    ah = int(_state.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # Apply on the capture thread so we never race camera.read().
+    applied = _state.request_resolution(int(w), int(h))
+    if not applied:
+        return jsonify({"success": False, "error": "Camera not running"})
+    aw, ah = applied
     return jsonify({"success": True, "width": aw, "height": ah})
 
 
 @blueprint.route("/resolutions")
 def list_resolutions():
     """Return the camera's supported resolutions (probed on start)."""
-    w = h = 0
-    if _state.camera and _state.camera.isOpened():
-        w = int(_state.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(_state.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    with _state.lock:
+        w, h = _state._last_resolution
+        res_list = list(_state._supported_resolutions)
     return jsonify({
         "success": True,
-        "resolutions": [{"width": rw, "height": rh}
-                        for rw, rh in _state._supported_resolutions],
+        "resolutions": [{"width": rw, "height": rh} for rw, rh in res_list],
         "current": {"width": w, "height": h},
     })
 

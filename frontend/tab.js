@@ -303,9 +303,26 @@
     }).catch(function () { return null; });
   }
 
+  /** Ensure resSelect has option w×h and select it (avoids blank dropdown). */
+  function selectResolution(w, h) {
+    w = parseInt(w, 10);
+    h = parseInt(h, 10);
+    // OpenCV can report -1 when CAP_PROP is unavailable — never show that.
+    if (!resSelect || !w || !h || w < 0 || h < 0) return;
+    var key = w + 'x' + h;
+    if (!resSelect.querySelector('option[value="' + key + '"]')) {
+      var opt = document.createElement('option');
+      opt.value = key;
+      opt.textContent = key;
+      resSelect.appendChild(opt);
+    }
+    resSelect.value = key;
+  }
+
   function loadResolutions() {
     ExtensionAPI.fetch('cv-pick', '/resolutions').then(function (data) {
       if (!data.success) return;
+      var prev = resSelect.value;
       resSelect.innerHTML = '';
       data.resolutions.forEach(function (r) {
         var opt = document.createElement('option');
@@ -313,8 +330,12 @@
         opt.textContent = r.width + 'x' + r.height;
         resSelect.appendChild(opt);
       });
-      if (data.current) {
-        resSelect.value = data.current.width + 'x' + data.current.height;
+      if (data.current && data.current.width && data.current.height) {
+        selectResolution(data.current.width, data.current.height);
+      } else if (prev && resSelect.querySelector('option[value="' + prev + '"]')) {
+        resSelect.value = prev;
+      } else if (resSelect.options.length) {
+        resSelect.selectedIndex = 0;
       }
     }).catch(function () {});
   }
@@ -436,15 +457,25 @@
   }
 
   resSelect.addEventListener('change', function () {
-    if (!cameraRunning) return;
+    if (!cameraRunning || cameraBusy) return;
     var parts = resSelect.value.split('x');
+    var reqW = parseInt(parts[0], 10);
+    var reqH = parseInt(parts[1], 10);
+    if (!reqW || !reqH) return;
+    // Keep the requested value selected while applying; then snap to actual.
+    var requestedKey = reqW + 'x' + reqH;
     ExtensionAPI.fetch('cv-pick', '/resolution', {
       method: 'POST',
-      body: JSON.stringify({ width: parseInt(parts[0], 10),
-                             height: parseInt(parts[1], 10) })
+      body: JSON.stringify({ width: reqW, height: reqH })
     }).then(function (data) {
-      if (data.success) {
-        resSelect.value = data.width + 'x' + data.height;
+      if (data && data.success && data.width > 0 && data.height > 0) {
+        selectResolution(data.width, data.height);
+      } else if (resSelect.querySelector('option[value="' + requestedKey + '"]')) {
+        resSelect.value = requestedKey;
+      }
+    }).catch(function () {
+      if (resSelect.querySelector('option[value="' + requestedKey + '"]')) {
+        resSelect.value = requestedKey;
       }
     });
   });
