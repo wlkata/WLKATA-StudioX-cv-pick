@@ -51,6 +51,35 @@
 .cvpick-select:focus {
   border-color: var(--accent, #2196F3);
 }
+.cvpick-select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.cvpick-cam-btn {
+  flex: 0 0 auto;
+  padding: 5px 14px;
+  border: 1px solid var(--accent, #2196F3);
+  border-radius: 6px;
+  background: var(--accent, #2196F3);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  outline: none;
+  white-space: nowrap;
+}
+.cvpick-cam-btn:hover:not(:disabled) {
+  filter: brightness(0.95);
+}
+.cvpick-cam-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.cvpick-cam-btn.is-stop {
+  background: var(--bg-secondary, #f5f5f5);
+  color: var(--text-primary, #333);
+  border-color: var(--border-primary, #ccc);
+}
 
 /* mode toggle (pill buttons) */
 .cvpick-mode-toggle {
@@ -173,13 +202,46 @@
 
 .cvpick-placeholder {
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  min-height: 180px;
+  gap: 12px;
+  min-height: 220px;
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg-secondary, #f0f0f0);
   color: var(--text-muted, #999);
   font-size: 13px;
+  z-index: 5; /* above ROI while loading / idle */
+  position: relative;
 }
-.cvpick-placeholder p { margin: 0; }
+.cvpick-placeholder p {
+  margin: 0;
+  text-align: center;
+  max-width: 90%;
+  line-height: 1.4;
+}
+.cvpick-loading-spinner {
+  display: none;
+  width: 28px;
+  height: 28px;
+  border: 3px solid var(--border-primary, #ccc);
+  border-top-color: var(--accent, #2196F3);
+  border-radius: 50%;
+  animation: cvpick-spin 0.7s linear infinite;
+}
+.cvpick-placeholder.is-loading .cvpick-loading-spinner {
+  display: block;
+}
+@keyframes cvpick-spin {
+  to { transform: rotate(360deg); }
+}
+/* Keep ROI/markers behind the loading cover */
+.cvpick-feed-wrap.is-loading .cvpick-roi-overlay,
+.cvpick-feed-wrap.is-loading .cvpick-marker {
+  visibility: hidden;
+  pointer-events: none;
+}
 
 /* ---- controls ---- */
 .cvpick-controls {

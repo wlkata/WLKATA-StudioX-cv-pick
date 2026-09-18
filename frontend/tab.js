@@ -2,6 +2,7 @@
   var feed        = document.getElementById('cvpick-feed');
   var placeholder = document.getElementById('cvpick-placeholder');
   var feedWrap    = document.getElementById('cvpick-feed-wrap');
+  var roiOverlay  = document.getElementById('cvpick-roi-overlay');
   var roiRect     = document.getElementById('cvpick-roi-rect');
   var nameInput   = document.getElementById('cvpick-name');
   var learnBtn    = document.getElementById('cvpick-learn-btn');
@@ -13,6 +14,7 @@
   var detectPhBtn = document.getElementById('cvpick-phase-detect');
   var learnControls = document.getElementById('cvpick-learn-controls');
   var cameraSelect  = document.getElementById('cvpick-camera-select');
+  var cameraStartBtn = document.getElementById('cvpick-camera-start');
   var resSelect     = document.getElementById('cvpick-resolution-select');
 
   // Calibration DOM refs
@@ -96,10 +98,19 @@
     return { left: 0, top: 0, width: r.width, height: r.height };
   }
 
+  /** Hide ROI + calibration markers (used while loading / idle). */
+  function hideOverlays() {
+    if (roiRect) roiRect.style.display = 'none';
+    if (markerA) markerA.style.display = 'none';
+    if (markerB) markerB.style.display = 'none';
+    if (markerC) markerC.style.display = 'none';
+  }
+
   /** Position the ROI overlay div from normalised roi coords. */
   function updateRoiVisual() {
-    if (feed.style.display === 'none') {
-      roiRect.style.display = 'none';
+    // Never show the detection square while loading or without a live feed.
+    if (cameraBusy || !cameraRunning || feed.style.display === 'none') {
+      if (roiRect) roiRect.style.display = 'none';
       return;
     }
     roiRect.style.display = '';
@@ -123,6 +134,7 @@
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
   function roiMouseDown(e) {
+    if (cameraBusy || !cameraRunning || feed.style.display === 'none') return;
     // Determine what was grabbed
     var target = e.target;
     var type = null;
@@ -213,20 +225,82 @@
 
   // ---- camera & resolution dropdowns ------------------------------------
 
+  var cameraBusy = false;
+  var cameraRunning = false;
+
+  /**
+   * Show the full-area cover over the feed (hides ROI / blank frame).
+   * @param {string} msg
+   * @param {boolean} [loading] show spinner when true
+   */
+  function setPlaceholder(msg, loading) {
+    feed.style.display = 'none';
+    placeholder.style.display = '';
+    placeholder.classList.toggle('is-loading', !!loading);
+    if (feedWrap) feedWrap.classList.toggle('is-loading', !!loading);
+    placeholder.querySelector('p').textContent =
+      msg || 'Select a camera and click Start';
+    hideOverlays();
+    updateRoiVisual();
+  }
+
+  function setIdlePlaceholder(msg) {
+    setPlaceholder(msg || 'Select a camera and click Start', false);
+  }
+
+  function showLiveFeed() {
+    placeholder.classList.remove('is-loading');
+    if (feedWrap) feedWrap.classList.remove('is-loading');
+    placeholder.style.display = 'none';
+    feed.style.display = 'block';
+    updateRoiVisual();
+  }
+
+  function updateStartBtn() {
+    if (!cameraStartBtn) return;
+    cameraStartBtn.textContent = cameraRunning ? 'Stop' : 'Start';
+    cameraStartBtn.classList.toggle('is-stop', cameraRunning);
+    cameraStartBtn.title = cameraRunning
+      ? 'Stop the camera'
+      : 'Start the selected camera';
+  }
+
+  function setCameraBusy(busy) {
+    cameraBusy = !!busy;
+    if (cameraSelect) cameraSelect.disabled = cameraBusy;
+    if (cameraStartBtn) cameraStartBtn.disabled = cameraBusy;
+    if (resSelect) resSelect.disabled = cameraBusy || !cameraRunning;
+    if (feedWrap) feedWrap.classList.toggle('is-loading', cameraBusy);
+    if (cameraBusy) hideOverlays();
+    updateRoiVisual();
+  }
+
+  function populateCameras(data) {
+    if (!data || !data.success || !cameraSelect) return;
+    var prev = cameraSelect.value;
+    cameraSelect.innerHTML = '';
+    (data.cameras || []).forEach(function (cam) {
+      var idx = (cam && typeof cam === 'object') ? cam.index : cam;
+      var name = (cam && typeof cam === 'object' && cam.name)
+        ? cam.name
+        : ('Camera ' + idx);
+      var opt = document.createElement('option');
+      opt.value = String(idx);
+      opt.textContent = name;
+      cameraSelect.appendChild(opt);
+    });
+    if (data.current !== null && data.current !== undefined) {
+      cameraSelect.value = String(data.current);
+    } else if (prev !== '' && cameraSelect.querySelector('option[value="' + prev + '"]')) {
+      cameraSelect.value = prev;
+    }
+  }
+
   function loadCameras() {
-    ExtensionAPI.fetch('cv-pick', '/cameras').then(function (data) {
-      if (!data.success) return;
-      cameraSelect.innerHTML = '';
-      data.cameras.forEach(function (idx) {
-        var opt = document.createElement('option');
-        opt.value = idx;
-        opt.textContent = 'Camera ' + idx;
-        cameraSelect.appendChild(opt);
-      });
-      if (data.current !== null && data.current !== undefined) {
-        cameraSelect.value = String(data.current);
-      }
-    }).catch(function () {});
+    return ExtensionAPI.fetch('cv-pick', '/cameras').then(function (data) {
+      populateCameras(data);
+      return data;
+    }).catch(function () { return null; });
   }
 
   function loadResolutions() {
@@ -245,24 +319,120 @@
     }).catch(function () {});
   }
 
-  cameraSelect.addEventListener('change', function () {
-    var idx = parseInt(cameraSelect.value, 10);
+  /** Poll /frame until a JPEG arrives or timeout (~8s). */
+  function waitForFirstFrame() {
+    var attempts = 0;
+    var maxAttempts = 40;
+    return new Promise(function (resolve) {
+      function tick() {
+        ExtensionAPI.fetch('cv-pick', '/frame').then(function (data) {
+          if (data && data.success && data.image) {
+            feed.src = 'data:image/jpeg;base64,' + data.image;
+            showLiveFeed();
+            resolve(true);
+            return;
+          }
+          attempts += 1;
+          if (attempts >= maxAttempts) {
+            resolve(false);
+            return;
+          }
+          setTimeout(tick, 200);
+        }).catch(function () {
+          attempts += 1;
+          if (attempts >= maxAttempts) {
+            resolve(false);
+            return;
+          }
+          setTimeout(tick, 250);
+        });
+      }
+      tick();
+    });
+  }
+
+  /**
+   * Open a camera index. Disables controls until success (first frame)
+   * or failure (unavailable / timeout / backend error).
+   */
+  function openCamera(idx) {
+    setCameraBusy(true);
     polling = false;
-    ExtensionAPI.fetch('cv-pick', '/start', {
+    setPlaceholder('Loading camera\u2026', true);
+
+    return ExtensionAPI.fetch('cv-pick', '/start', {
       method: 'POST',
       body: JSON.stringify({ camera: idx })
     }).then(function (data) {
-      if (data.success) {
-        polling = true;
-        pollFrame();
-        loadResolutions();
-      } else {
-        ExtensionAPI.showNotification(data.error || 'Camera failed', 'error');
+      if (!data || !data.success) {
+        cameraRunning = false;
+        updateStartBtn();
+        setPlaceholder((data && data.error) || 'Camera unavailable', false);
+        ExtensionAPI.showNotification(
+          (data && data.error) || 'Camera failed', 'error');
+        setCameraBusy(false);
+        return false;
       }
+      setPlaceholder('Loading camera\u2026', true);
+      return waitForFirstFrame().then(function (ok) {
+        if (ok) {
+          cameraRunning = true;
+          loadResolutions();
+          polling = true;
+          pollFrame();
+        } else {
+          cameraRunning = false;
+          setPlaceholder('Camera unavailable', false);
+        }
+        updateStartBtn();
+        setCameraBusy(false);
+        return ok;
+      });
+    }).catch(function () {
+      cameraRunning = false;
+      updateStartBtn();
+      setPlaceholder('Backend not reachable', false);
+      setCameraBusy(false);
+      return false;
     });
+  }
+
+  function stopCameraStream() {
+    polling = false;
+    cameraRunning = false;
+    updateStartBtn();
+    ExtensionAPI.fetch('cv-pick', '/stop', { method: 'POST' }).catch(function () {});
+    if (resSelect) resSelect.innerHTML = '';
+    setIdlePlaceholder('Select a camera and click Start');
+    setCameraBusy(false);
+  }
+
+  // Changing camera only switches while a session is already running.
+  cameraSelect.addEventListener('change', function () {
+    if (cameraBusy || !cameraRunning) return;
+    var idx = parseInt(cameraSelect.value, 10);
+    if (isNaN(idx)) return;
+    openCamera(idx);
   });
 
+  if (cameraStartBtn) {
+    cameraStartBtn.addEventListener('click', function () {
+      if (cameraBusy) return;
+      if (cameraRunning) {
+        stopCameraStream();
+        return;
+      }
+      var idx = parseInt(cameraSelect.value, 10);
+      if (isNaN(idx)) {
+        ExtensionAPI.showNotification('Select a camera first', 'error');
+        return;
+      }
+      openCamera(idx);
+    });
+  }
+
   resSelect.addEventListener('change', function () {
+    if (!cameraRunning) return;
     var parts = resSelect.value.split('x');
     ExtensionAPI.fetch('cv-pick', '/resolution', {
       method: 'POST',
@@ -286,23 +456,25 @@
   // ---- frame polling (replaces MJPEG — works with file:// origin) -------
 
   function pollFrame() {
-    if (!polling) return;
+    if (!polling || cameraBusy) return;
     ExtensionAPI.fetch('cv-pick', '/frame').then(function (data) {
       if (data.success) {
         feed.src = 'data:image/jpeg;base64,' + data.image;
-        feed.style.display = 'block';
-        placeholder.style.display = 'none';
+        showLiveFeed();
       }
-      if (polling) setTimeout(pollFrame, 33); // ~30 fps cap
+      if (polling && !cameraBusy) setTimeout(pollFrame, 33); // ~30 fps cap
     }).catch(function () {
-      if (polling) setTimeout(pollFrame, 500); // back off on error
+      if (polling && !cameraBusy) setTimeout(pollFrame, 500); // back off on error
     });
   }
 
   var refreshTimer = null;
 
-  function startCamera() {
-    // Sync ROI from backend
+  /**
+   * Tab open / return from another tab:
+   * refresh camera list (plug/unplug) and stay idle until Start.
+   */
+  function prepareCameraTab() {
     ExtensionAPI.fetch('cv-pick', '/roi').then(function (data) {
       if (data.success && data.roi && data.roi.length === 4) {
         roi.x1 = data.roi[0]; roi.y1 = data.roi[1];
@@ -310,25 +482,30 @@
       }
     }).catch(function () {});
 
-    loadCameras();
+    // Leaving the tab stops the stream; always re-enter idle and refresh list.
+    cameraRunning = false;
+    polling = false;
+    updateStartBtn();
+    if (resSelect) resSelect.innerHTML = '';
 
-    var camIdx = parseInt(cameraSelect.value, 10) || 0;
-    ExtensionAPI.fetch('cv-pick', '/start', {
-      method: 'POST',
-      body: JSON.stringify({ camera: camIdx })
-    }).then(function (data) {
-      if (data.success) {
-        polling = true;
-        pollFrame();
-        loadResolutions();
+    setCameraBusy(true);
+    setPlaceholder('Loading camera list\u2026', true);
+
+    loadCameras().then(function (data) {
+      setCameraBusy(false);
+      if (!data || !data.success) {
+        setPlaceholder('Could not list cameras', false);
+      } else if (!data.cameras || !data.cameras.length) {
+        setPlaceholder('No cameras found', false);
       } else {
-        placeholder.querySelector('p').textContent =
-          data.error || 'Camera unavailable';
+        setIdlePlaceholder('Select a camera and click Start');
       }
       refreshLearned();
     }).catch(function () {
-      placeholder.querySelector('p').textContent = 'Backend not reachable';
+      setCameraBusy(false);
+      setPlaceholder('Backend not reachable', false);
     });
+
     if (!refreshTimer) {
       refreshTimer = setInterval(refreshLearned, 3000);
     }
@@ -336,6 +513,10 @@
 
   function stopCamera() {
     polling = false;
+    cameraRunning = false;
+    updateStartBtn();
+    setCameraBusy(false);
+    hideOverlays();
     ExtensionAPI.fetch('cv-pick', '/stop', { method: 'POST' }).catch(function () {});
     if (refreshTimer) {
       clearInterval(refreshTimer);
@@ -343,12 +524,13 @@
     }
   }
 
-  // Lifecycle: pause camera when user leaves tab, resume when they return
-  ExtensionAPI.onActivate('cv-pick', startCamera);
+  // Lifecycle: list cameras on enter; release device when leaving
+  ExtensionAPI.onActivate('cv-pick', prepareCameraTab);
   ExtensionAPI.onDeactivate('cv-pick', stopCamera);
 
-  // Initial start (IIFE runs on first tab click via lazy loading)
-  startCamera();
+  // First open (IIFE runs on first tab click via lazy loading)
+  prepareCameraTab();
+  updateStartBtn();
 
   // ---- mode toggle ------------------------------------------------------
 

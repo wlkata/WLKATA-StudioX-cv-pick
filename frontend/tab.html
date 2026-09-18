@@ -3,7 +3,8 @@
     <div id="cvpick-feed-wrap" class="cvpick-feed-wrap">
       <img id="cvpick-feed" class="cvpick-feed" alt="Camera feed" />
       <div id="cvpick-placeholder" class="cvpick-placeholder">
-        <p>Starting camera&hellip;</p>
+        <div class="cvpick-loading-spinner" aria-hidden="true"></div>
+        <p>Select a camera and click Start</p>
       </div>
       <div id="cvpick-roi-overlay" class="cvpick-roi-overlay">
         <div id="cvpick-roi-rect" class="cvpick-roi-rect">
@@ -24,6 +25,7 @@
     <div class="cvpick-toolbar">
       <div class="cvpick-toolbar-row">
         <select id="cvpick-camera-select" class="cvpick-select" title="Camera"></select>
+        <button type="button" id="cvpick-camera-start" class="cvpick-cam-btn" title="Start or stop the selected camera">Start</button>
         <select id="cvpick-resolution-select" class="cvpick-select" title="Resolution"></select>
       </div>
       <div class="cvpick-toolbar-row">

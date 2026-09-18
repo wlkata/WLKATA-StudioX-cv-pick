@@ -7,6 +7,10 @@ item, draws bounding-box overlays, and exposes the result as an MJPEG stream.
 """
 
 import base64
+import json
+import os
+import platform
+import subprocess
 import threading
 import time
 import uuid
@@ -34,6 +38,143 @@ _PALETTE = [
     (0, 188, 212),    # cyan
     (255, 87, 34),    # deep-orange
 ]
+
+
+# ---------------------------------------------------------------------------
+#  Camera enumeration (friendly names when the OS provides them)
+# ---------------------------------------------------------------------------
+
+def _open_capture(index):
+    """Open a capture with the platform backend that matches name order."""
+    system = platform.system()
+    backends = []
+    if system == "Windows":
+        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF]
+    elif system == "Darwin":
+        backends = [cv2.CAP_AVFOUNDATION]
+    for be in backends:
+        cap = cv2.VideoCapture(index, be)
+        if cap.isOpened():
+            return cap
+        cap.release()
+    cap = cv2.VideoCapture(index)
+    return cap
+
+
+def _camera_names_windows():
+    """DirectShow device names — index order matches OpenCV CAP_DSHOW."""
+    try:
+        from pygrabber.dshow_graph import FilterGraph
+        names = FilterGraph().get_input_devices()
+        if names:
+            return list(names)
+    except Exception:
+        pass
+    # Fallback: PnP camera/image devices (order may not match OpenCV)
+    try:
+        out = subprocess.check_output(
+            [
+                "powershell", "-NoProfile", "-Command",
+                "Get-PnpDevice -Class Camera,Image -Status OK -ErrorAction SilentlyContinue "
+                "| Select-Object -ExpandProperty FriendlyName",
+            ],
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        names = [ln.strip() for ln in out.splitlines() if ln.strip()]
+        return names
+    except Exception:
+        return []
+
+
+def _camera_names_macos():
+    try:
+        out = subprocess.check_output(
+            ["system_profiler", "SPCameraDataType", "-json"],
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        data = json.loads(out.decode("utf-8", errors="replace"))
+        names = []
+        for cam in data.get("SPCameraDataType") or []:
+            name = cam.get("_name")
+            if name:
+                names.append(str(name))
+        return names
+    except Exception:
+        return []
+
+
+def _camera_names_linux():
+    names = []
+    try:
+        import glob
+        paths = sorted(
+            glob.glob("/sys/class/video4linux/video*"),
+            key=lambda p: int(os.path.basename(p).replace("video", "") or 0),
+        )
+        for path in paths:
+            # Skip metadata nodes when possible (index >= 64 often meta)
+            base = os.path.basename(path)
+            try:
+                idx = int(base.replace("video", ""))
+            except ValueError:
+                idx = 0
+            if idx >= 64:
+                continue
+            name_path = os.path.join(path, "name")
+            try:
+                with open(name_path, "r", encoding="utf-8", errors="replace") as f:
+                    names.append(f.read().strip() or base)
+            except OSError:
+                names.append(base)
+    except Exception:
+        pass
+    return names
+
+
+def _platform_camera_names():
+    system = platform.system()
+    if system == "Windows":
+        return _camera_names_windows()
+    if system == "Darwin":
+        return _camera_names_macos()
+    if system == "Linux":
+        return _camera_names_linux()
+    return []
+
+
+def enumerate_cameras(max_probe=10, skip_index=None):
+    """
+    Return [{index, name}, ...]. Prefer OS device names; fall back to probing
+    indices 0..max_probe-1 as "Camera N".
+
+    skip_index: if set, treat that index as available without re-opening
+    (used when that camera is already held by the capture thread).
+    """
+    names = _platform_camera_names()
+    if names:
+        return [
+            {"index": i, "name": (n.strip() if n and str(n).strip() else f"Camera {i}")}
+            for i, n in enumerate(names)
+        ]
+
+    out = []
+    for i in range(max_probe):
+        if skip_index is not None and i == skip_index:
+            out.append({"index": i, "name": f"Camera {i}"})
+            continue
+        cap = _open_capture(i)
+        try:
+            if cap is not None and cap.isOpened():
+                out.append({"index": i, "name": f"Camera {i}"})
+        finally:
+            if cap is not None:
+                cap.release()
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -265,11 +406,13 @@ class _CVState:
             if self._camera_index == camera_index:
                 return True
             self.stop()
-        cap = cv2.VideoCapture(camera_index)
-        if not cap.isOpened():
+        cap = _open_capture(int(camera_index))
+        if cap is None or not cap.isOpened():
+            if cap is not None:
+                cap.release()
             return False
         self.camera = cap
-        self._camera_index = camera_index
+        self._camera_index = int(camera_index)
         self._probe_resolutions(cap)
         self.running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -735,19 +878,14 @@ def stop_camera():
 
 @blueprint.route("/cameras")
 def list_cameras():
-    """Probe available camera indices (0-4)."""
-    cameras = []
-    current = _state._camera_index
-    for i in range(5):
-        if i == current and _state.running:
-            cameras.append(i)
-            continue
-        cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            cameras.append(i)
-            cap.release()
-    return jsonify({"success": True, "cameras": cameras,
-                    "current": current if _state.running else None})
+    """List cameras as [{index, name}, ...] with friendly OS names when possible."""
+    skip = _state._camera_index if _state.running else None
+    cameras = enumerate_cameras(max_probe=10, skip_index=skip)
+    return jsonify({
+        "success": True,
+        "cameras": cameras,
+        "current": _state._camera_index if _state.running else None,
+    })
 
 
 @blueprint.route("/resolution", methods=["GET", "POST"])
