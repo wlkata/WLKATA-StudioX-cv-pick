@@ -378,14 +378,18 @@
         if (ok) {
           cameraRunning = true;
           loadResolutions();
+          updateStartBtn();
+          // Clear busy before starting the poll loop — pollFrame() no-ops
+          // while cameraBusy is true, which froze the feed on frame 1.
+          setCameraBusy(false);
           polling = true;
           pollFrame();
         } else {
           cameraRunning = false;
           setPlaceholder('Camera unavailable', false);
+          updateStartBtn();
+          setCameraBusy(false);
         }
-        updateStartBtn();
-        setCameraBusy(false);
         return ok;
       });
     }).catch(function () {
@@ -456,15 +460,26 @@
   // ---- frame polling (replaces MJPEG — works with file:// origin) -------
 
   function pollFrame() {
-    if (!polling || cameraBusy) return;
+    if (!polling) return;
+    // Skip work while opening/switching, but keep the loop alive so frames
+    // resume automatically when busy clears.
+    if (cameraBusy) {
+      setTimeout(pollFrame, 100);
+      return;
+    }
     ExtensionAPI.fetch('cv-pick', '/frame').then(function (data) {
+      if (!polling) return;
+      if (cameraBusy) {
+        setTimeout(pollFrame, 100);
+        return;
+      }
       if (data.success) {
         feed.src = 'data:image/jpeg;base64,' + data.image;
         showLiveFeed();
       }
-      if (polling && !cameraBusy) setTimeout(pollFrame, 33); // ~30 fps cap
+      if (polling) setTimeout(pollFrame, 33); // ~30 fps cap
     }).catch(function () {
-      if (polling && !cameraBusy) setTimeout(pollFrame, 500); // back off on error
+      if (polling) setTimeout(pollFrame, 500); // back off on error
     });
   }
 
