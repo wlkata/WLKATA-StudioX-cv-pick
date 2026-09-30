@@ -35,6 +35,7 @@
   var markerC        = document.getElementById('cvpick-marker-c');
 
   var polling = false;
+  var currentMode = 'color';
 
   // ---- robot jog controls -----------------------------------------------
 
@@ -808,12 +809,14 @@
   // ---- mode toggle ------------------------------------------------------
 
   function setMode(mode) {
+    currentMode = mode;
     colorBtn.classList.toggle('active', mode === 'color');
     shapeBtn.classList.toggle('active', mode === 'shape');
     ExtensionAPI.fetch('cv-pick', '/mode', {
       method: 'POST',
       body: JSON.stringify({ mode: mode })
     });
+    refreshLearned();
   }
 
   colorBtn.addEventListener('click', function () { setMode('color'); });
@@ -870,16 +873,27 @@
   // ---- learned-items list -----------------------------------------------
 
   function refreshLearned() {
+    var kind = currentMode === 'shape' ? 'shapes' : 'colors';
+    var titleEl = document.getElementById('cvpick-learned-title');
+    if (titleEl) {
+      titleEl.textContent = currentMode === 'shape' ? 'Learned Shapes' : 'Learned Colors';
+    }
+
     ExtensionAPI.fetch('cv-pick', '/learned').then(function (data) {
-      if (!data.success || !data.items || data.items.length === 0) {
+      var items = (data.success && data.items) ? data.items : [];
+      var filtered = items.filter(function (item) {
+        return item.mode === currentMode;
+      });
+
+      if (filtered.length === 0) {
         learnedList.innerHTML =
-          '<p class="cvpick-empty">No items learned yet. '
+          '<p class="cvpick-empty">No ' + kind + ' learned yet. '
           + 'Place an object in the zone and click Learn.</p>';
         return;
       }
 
       var html = '';
-      data.items.forEach(function (item) {
+      filtered.forEach(function (item) {
         // display_color is BGR from OpenCV — swap to RGB for CSS
         var r = item.display_color[2];
         var g = item.display_color[1];
@@ -889,7 +903,6 @@
         html += '<div class="cvpick-item">'
           + '<span class="cvpick-dot" style="background:' + rgb + '"></span>'
           + '<span class="cvpick-item-name">' + escHtml(item.name) + '</span>'
-          + '<span class="cvpick-item-mode">' + item.mode + '</span>'
           + '<button class="cvpick-item-rm" data-id="' + item.id + '">'
           + '&times;</button>'
           + '</div>';
