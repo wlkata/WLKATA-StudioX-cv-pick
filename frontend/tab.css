@@ -529,11 +529,13 @@
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  flex-wrap: wrap;
 }
 .cvpick-jog-step-row {
   display: flex;
   align-items: center;
   gap: 4px;
+  flex-wrap: wrap;
 }
 .cvpick-jog-step-group {
   display: flex;
@@ -556,6 +558,28 @@
 .cvpick-jog-step.active {
   background: var(--accent, #2196F3);
   color: #fff;
+}
+.cvpick-jog-step-input {
+  width: 48px;
+  padding: 3px 4px;
+  border: 1px solid var(--border-primary, #ccc);
+  border-radius: 4px;
+  background: var(--bg-secondary, #f5f5f5);
+  color: var(--text-primary, #333);
+  font-size: 11px;
+  font-weight: 600;
+  text-align: center;
+  outline: none;
+  -moz-appearance: textfield;
+}
+.cvpick-jog-step-input::-webkit-outer-spin-button,
+.cvpick-jog-step-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.cvpick-jog-step-input:focus,
+.cvpick-jog-step-input.custom-active {
+  border-color: var(--accent, #2196F3);
 }
 .cvpick-jog-unit {
   font-size: 10px;

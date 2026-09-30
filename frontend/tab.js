@@ -87,13 +87,41 @@
   loadRobots();
   ExtensionAPI.onActivate('cv-pick', loadRobots);
 
-  // Step selector
+  // Step selector (presets + custom mm)
   var stepBtns = document.querySelectorAll('.cvpick-jog-step');
+  var stepInput = document.getElementById('cvpick-jog-step-custom');
+
+  function applyJogStep(step, fromPreset) {
+    if (!(step > 0) || !isFinite(step)) return false;
+    jogStep = step;
+    var matched = false;
+    for (var k = 0; k < stepBtns.length; k++) {
+      var btnStep = parseFloat(stepBtns[k].getAttribute('data-step'));
+      var on = btnStep === step;
+      stepBtns[k].classList.toggle('active', on);
+      if (on) matched = true;
+    }
+    if (stepInput) {
+      if (fromPreset) stepInput.value = String(step);
+      stepInput.classList.toggle('custom-active', !matched);
+    }
+    return true;
+  }
+
   for (var si = 0; si < stepBtns.length; si++) {
     stepBtns[si].addEventListener('click', function () {
-      for (var k = 0; k < stepBtns.length; k++) stepBtns[k].classList.remove('active');
-      this.classList.add('active');
-      jogStep = parseInt(this.getAttribute('data-step'), 10);
+      applyJogStep(parseFloat(this.getAttribute('data-step')), true);
+    });
+  }
+  if (stepInput) {
+    stepInput.addEventListener('input', function () {
+      applyJogStep(parseFloat(this.value), false);
+    });
+    stepInput.addEventListener('change', function () {
+      if (!applyJogStep(parseFloat(this.value), false)) {
+        this.value = String(jogStep);
+        applyJogStep(jogStep, false);
+      }
     });
   }
 
