@@ -285,9 +285,24 @@
     updateRoiVisual();
   }
 
+  function selectedCameraName() {
+    if (!cameraSelect || cameraSelect.selectedIndex < 0) return '';
+    var opt = cameraSelect.options[cameraSelect.selectedIndex];
+    return (opt && opt.textContent) || '';
+  }
+
+  function cameraNameSet(payload) {
+    var set = {};
+    var cams = (payload && payload.cameras) || [];
+    for (var i = 0; i < cams.length; i++) {
+      var n = (cams[i] && typeof cams[i] === 'object') ? cams[i].name : '';
+      if (n) set[n] = true;
+    }
+    return set;
+  }
+
   function populateCameras(data) {
     if (!data || !data.success || !cameraSelect) return;
-    var prev = cameraSelect.value;
     cameraMeta = {};
     cameraSelect.innerHTML = '';
     (data.cameras || []).forEach(function (cam) {
@@ -307,17 +322,41 @@
       opt.textContent = name;
       cameraSelect.appendChild(opt);
     });
-    if (data.current !== null && data.current !== undefined) {
+  }
+
+  function restoreCameraSelection(data, keepName, oldNames) {
+    if (!cameraSelect) return;
+    if (data && data.current !== null && data.current !== undefined) {
       cameraSelect.value = String(data.current);
-    } else if (prev !== '' && cameraSelect.querySelector('option[value="' + prev + '"]')) {
-      cameraSelect.value = prev;
+      return;
+    }
+    var cams = (data && data.cameras) || [];
+    if (oldNames) {
+      for (var i = 0; i < cams.length; i++) {
+        var n = (cams[i] && cams[i].name) || '';
+        if (n && !oldNames[n] && cams[i].index !== undefined
+            && cams[i].index !== null && cams[i].index !== '') {
+          cameraSelect.value = String(cams[i].index);
+          return;
+        }
+      }
+    }
+    if (keepName) {
+      for (var j = 0; j < cameraSelect.options.length; j++) {
+        if (cameraSelect.options[j].textContent === keepName) {
+          cameraSelect.selectedIndex = j;
+          return;
+        }
+      }
     }
   }
 
-  function applyCameraList(data) {
+  function applyCameraList(data, opts) {
+    opts = opts || {};
     if (!data || !data.success) return false;
     lastCameraPayload = data;
     populateCameras(data);
+    restoreCameraSelection(data, opts.keepName, opts.oldNames);
     return !!(data.cameras && data.cameras.length);
   }
 
@@ -336,19 +375,17 @@
   function mergeCameraPayload(prev, fresh) {
     if (!fresh || !fresh.success) return prev;
     if (!prev || !prev.cameras || !prev.cameras.length) return fresh;
-    var byIndex = {};
-    function put(cam) {
-      var idx = (cam && typeof cam === 'object') ? cam.index : cam;
-      if (idx === undefined || idx === null || idx === '') return;
-      byIndex[String(idx)] = (cam && typeof cam === 'object')
-        ? cam
-        : { index: idx, name: 'Camera ' + idx };
-    }
-    (prev.cameras || []).forEach(put);
-    (fresh.cameras || []).forEach(put);
-    var cameras = Object.keys(byIndex).sort(function (a, b) {
-      return parseInt(a, 10) - parseInt(b, 10);
-    }).map(function (k) { return byIndex[k]; });
+    // Fresh enumerate is the occupancy source (OS index + name).
+    // Do not keep stale prev-at-index-0 (OBS) after USB takes that slot.
+    var prevByName = {};
+    (prev.cameras || []).forEach(function (cam) {
+      if (cam && cam.name) prevByName[cam.name] = cam;
+    });
+    var cameras = (fresh.cameras || []).map(function (cam) {
+      if (!cam || typeof cam !== 'object') return cam;
+      if (cam.resolutions && cam.resolutions.length) return cam;
+      return prevByName[cam.name] || cam;
+    });
     return {
       success: true,
       cameras: cameras,
@@ -543,6 +580,39 @@
     openCamera(idx);
   });
 
+  function discoverThenStart() {
+    var keepName = selectedCameraName();
+    var oldNames = cameraNameSet(lastCameraPayload);
+    var skip = cachedCameraIndices();
+    var q = '?discover=1';
+    if (skip.length) q += '&skip=' + encodeURIComponent(skip.join(','));
+    setCameraBusy(true);
+    setPlaceholder('Loading camera\u2026', true);
+    return loadCameras(q).then(function (data) {
+      if (data && data.success) {
+        data = lastCameraPayload
+          ? mergeCameraPayload(lastCameraPayload, data)
+          : data;
+        applyCameraList(data, { keepName: keepName, oldNames: oldNames });
+      }
+      var idx = parseInt(cameraSelect.value, 10);
+      if (isNaN(idx)) {
+        setCameraBusy(false);
+        ExtensionAPI.showNotification('Select a camera first', 'error');
+        return false;
+      }
+      return openCamera(idx);
+    }).catch(function () {
+      var idx = parseInt(cameraSelect.value, 10);
+      if (isNaN(idx)) {
+        setCameraBusy(false);
+        setPlaceholder('Backend not reachable', false);
+        return false;
+      }
+      return openCamera(idx);
+    });
+  }
+
   if (cameraStartBtn) {
     cameraStartBtn.addEventListener('click', function () {
       if (cameraBusy) return;
@@ -550,12 +620,7 @@
         stopCameraStream();
         return;
       }
-      var idx = parseInt(cameraSelect.value, 10);
-      if (isNaN(idx)) {
-        ExtensionAPI.showNotification('Select a camera first', 'error');
-        return;
-      }
-      openCamera(idx);
+      discoverThenStart();
     });
   }
 
@@ -637,10 +702,10 @@
 
   var refreshTimer = null;
 
-  function showListResult(data, hadCache) {
+  function showListResult(data, hadCache, keepName, oldNames) {
     setCameraBusy(false);
     if (data && data.success) {
-      applyCameraList(data);
+      applyCameraList(data, { keepName: keepName, oldNames: oldNames });
       if (!data.cameras || !data.cameras.length) {
         setPlaceholder('No cameras found', false);
       } else {
@@ -661,6 +726,8 @@
     var req = ++listRequestId;
     var hadCache = !!(lastCameraPayload && lastCameraPayload.cameras &&
       lastCameraPayload.cameras.length);
+    var keepName = selectedCameraName();
+    var oldNames = cameraNameSet(lastCameraPayload);
 
     ExtensionAPI.fetch('cv-pick', '/roi').then(function (data) {
       if (data.success && data.roi && data.roi.length === 4) {
@@ -675,7 +742,7 @@
     if (resSelect) resSelect.innerHTML = '';
 
     if (hadCache) {
-      applyCameraList(lastCameraPayload);
+      applyCameraList(lastCameraPayload, { keepName: keepName });
       setCameraBusy(false);
       setIdlePlaceholder('Select a camera and click Start');
     } else {
@@ -700,7 +767,7 @@
         }
         if (data && data.success) lastCameraPayload = data;
         if (req !== listRequestId) return;
-        showListResult(data, hadCache);
+        showListResult(data, hadCache, keepName, oldNames);
       }).catch(function () {
         if (req !== listRequestId) return;
         setCameraBusy(false);

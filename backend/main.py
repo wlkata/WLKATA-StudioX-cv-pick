@@ -223,10 +223,11 @@ def _camera_names_linux():
 _names_cache = (None, 0.0)  # (names, monotonic ts)
 
 
-def _platform_camera_names():
+def _platform_camera_names(force=False):
     global _names_cache
     names, ts = _names_cache
-    if names is not None and (time.monotonic() - ts) < 20:
+    if (not force and names is not None
+            and (time.monotonic() - ts) < 20):
         return list(names)
     system = platform.system()
     if system == "Windows":
@@ -352,16 +353,51 @@ def _catalog_copy():
         return {int(k): dict(v) for k, v in _device_catalog.items()}
 
 
+def _norm_cam_name(name):
+    return " ".join(str(name or "").strip().lower().split())
+
+
+def _same_camera(cached_name, os_name):
+    """True only when both sides have a name and they match."""
+    a = _norm_cam_name(cached_name)
+    b = _norm_cam_name(os_name)
+    return bool(a) and bool(b) and a == b
+
+
 def _reuse_entry(index, name, prev):
-    """Copy a catalog entry without opening the device. None if unusable."""
+    """
+    Reuse a catalog entry without opening the device.
+
+    Index alone is not identity: plugging in a USB camera on Windows often
+    takes index 0 and shifts OBS Virtual Camera to 1. Only reuse when the
+    OS name at this index still matches the cached device.
+    """
     entry = prev.get(int(index))
     if not entry or not entry.get("resolutions"):
+        return None
+    if name and entry.get("name") and not _same_camera(entry.get("name"), name):
         return None
     out = dict(entry)
     out["index"] = int(index)
     if name:
         out["name"] = name
     return out
+
+
+def _reuse_by_name(name, prev, index):
+    """Reuse a cached device that moved to a new OpenCV index."""
+    if not name or not prev:
+        return None
+    for entry in prev.values():
+        if not entry or not entry.get("resolutions"):
+            continue
+        if not _same_camera(entry.get("name"), name):
+            continue
+        out = dict(entry)
+        out["index"] = int(index)
+        out["name"] = name
+        return out
+    return None
 
 
 def _parse_index_set(raw):
@@ -385,12 +421,13 @@ def enumerate_cameras(max_probe=10, skip_index=None, skip_entry=None,
     skip_index / skip_entry: camera already held by the live session — do not
     re-open it; reuse the running session's probed list instead.
 
-    reuse_cached: never re-open an index already in the catalog. Brand-new
-    indices are probed. Failed opens are retried only when the catalog is
-    still empty (first-open warmup). Unplugged indices drop out of the OS
-    name list and are omitted, still without being opened.
+    reuse_cached: never re-open an index already in the catalog *if the OS
+    name still matches*. A new name at a cached index is probed. A cached
+    name that moved to a new index is reused without opening. Failed opens
+    are retried only when the catalog is still empty.
 
-    never_probe: extra indices the client already has cached — never opened.
+    never_probe: extra indices the client already has cached — ignored when
+    the name at that index changed.
     """
     with _enumerate_lock:
         return _enumerate_cameras_locked(
@@ -404,7 +441,9 @@ def enumerate_cameras(max_probe=10, skip_index=None, skip_entry=None,
 
 def _enumerate_cameras_locked(max_probe, skip_index, skip_entry, reuse_cached,
                               never_probe):
-    names = _platform_camera_names()
+    # Always refresh OS names on enumerate so a just-plugged USB camera is
+    # visible. The 20s cache would hide hotplug during discover.
+    names = _platform_camera_names(force=True)
     prev = _catalog_copy()
 
     if names:
@@ -428,7 +467,10 @@ def _enumerate_cameras_locked(max_probe, skip_index, skip_entry, reuse_cached,
             if skip_entry and skip_entry.get("resolutions"):
                 entry = dict(skip_entry)
                 entry["index"] = i
-                entry["name"] = entry.get("name") or name
+                live_name = skip_entry.get("name") or ""
+                # Keep the held device's name; do not relabel it as a newly
+                # plugged camera that stole this index in the OS list.
+                entry["name"] = live_name or name
                 out.append(entry)
                 _probed_indices.add(i)
                 continue
@@ -440,16 +482,14 @@ def _enumerate_cameras_locked(max_probe, skip_index, skip_entry, reuse_cached,
 
         if reuse_cached:
             reused = _reuse_entry(i, name, prev)
+            if not reused:
+                reused = _reuse_by_name(name, prev, i)
             if reused:
                 out.append(reused)
                 _probed_indices.add(i)
                 _failed_indices.discard(i)
                 continue
-            # Client already has this index cached — do not open it.
-            if i in never_probe:
-                continue
             # Known-dead only skipped once we already have a working list.
-            # On a cold first open (empty catalog) retry warmup failures.
             if i in _failed_indices and prev:
                 continue
 
