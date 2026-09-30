@@ -42,6 +42,7 @@
 
   var polling = false;
   var currentMode = 'color';
+  var currentPhase = 'learning';
   var LIFT_MIN = 1;
   var LIFT_MAX = 100;
   var liftHeight = 10;
@@ -1001,6 +1002,7 @@
   // ---- phase toggle (learning / inference) ------------------------------
 
   function setPhase(phase) {
+    currentPhase = phase;
     learnPhBtn.classList.toggle('active', phase === 'learning');
     detectPhBtn.classList.toggle('active', phase === 'inference');
     learnControls.style.display = phase === 'learning' ? '' : 'none';
@@ -1008,6 +1010,13 @@
       method: 'POST',
       body: JSON.stringify({ phase: phase })
     });
+    if (phase === 'learning') {
+      calibState.pixelA = null;
+      calibState.pixelB = null;
+      calibState.pixelC = null;
+      updateCalibUI();
+    }
+    updateCalibDetectBtn();
   }
 
   learnPhBtn.addEventListener('click', function () { setPhase('learning'); });
@@ -1158,6 +1167,15 @@
     calibSaveBtn.disabled = !(calibState.pixelA && calibState.pixelB && calibState.pixelC
                               && calibState.robotA && calibState.robotB && calibState.robotC);
     updateMarkers();
+    updateCalibDetectBtn();
+  }
+
+  function updateCalibDetectBtn() {
+    var inDetect = currentPhase === 'inference';
+    calibDetectBtn.disabled = !inDetect || pickRunning;
+    calibDetectBtn.title = inDetect
+      ? 'Detect 3 objects in the zone as calibration markers'
+      : 'Switch to Detect mode to detect markers';
   }
 
   function saveCalibPoses() {
@@ -1185,13 +1203,18 @@
     }).catch(function () {});
   }
 
-  // Detect markers — pick 2 largest detections
+  // Detect markers — pick 3 largest detections (Detect mode only)
   calibDetectBtn.addEventListener('click', function () {
+    if (currentPhase !== 'inference') {
+      ExtensionAPI.showNotification('Switch to Detect mode to detect markers', 'error');
+      return;
+    }
     calibDetectBtn.disabled = true;
     calibDetectBtn.textContent = 'Detecting\u2026';
     ExtensionAPI.fetch('cv-pick', '/detections').then(function (data) {
-      calibDetectBtn.disabled = false;
       calibDetectBtn.textContent = 'Detect Markers';
+      updateCalibDetectBtn();
+      if (currentPhase !== 'inference') return;
       if (!data.success || !data.detections || data.detections.length < 3) {
         ExtensionAPI.showNotification(
           'Need at least 3 detected objects. Learn an item, switch to Detect, and place 3 markers in an L-shape.',
@@ -1211,8 +1234,8 @@
         'Markers detected: A (red), B (blue), C (green)',
         'info');
     }).catch(function () {
-      calibDetectBtn.disabled = false;
       calibDetectBtn.textContent = 'Detect Markers';
+      updateCalibDetectBtn();
     });
   });
 
