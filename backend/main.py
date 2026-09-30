@@ -27,6 +27,11 @@ _CANDIDATE_RESOLUTIONS = [
     (1280, 720), (1280, 960), (1920, 1080), (2560, 1440),
     (3840, 2160),
 ]
+# Listing only needs to prove the device works. Sweeping 4K on every
+# tab-open overruns the 30s proxy and surfaces as "Could not list cameras".
+_LIST_RESOLUTIONS = [
+    (640, 480), (1280, 720), (800, 600), (1920, 1080),
+]
 
 _PALETTE = [
     (66, 133, 244),   # blue
@@ -61,8 +66,59 @@ def _configure_size(cap, width, height):
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
 
 
+def _is_blank_frame(frame):
+    """True for empty or USB-warmup all-black frames (not a dim room)."""
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return True
+    try:
+        return int(frame.max()) < 12
+    except Exception:
+        return False
+
+
+def _read_frame_size(cap, tries=8, require_content=False, pause=0.02):
+    """Return (w, h) from a decoded frame, or None if the device is silent."""
+    last = None
+    for _ in range(tries):
+        ret, frame = cap.read()
+        if ret and frame is not None and getattr(frame, "size", 0):
+            h, w = int(frame.shape[0]), int(frame.shape[1])
+            if w > 0 and h > 0:
+                last = (w, h)
+                if not require_content or not _is_blank_frame(frame):
+                    return last
+        if pause:
+            time.sleep(pause)
+    return None if require_content else last
+
+
+def _warmup_open(cap):
+    """isOpened() is not enough — require at least one decoded frame."""
+    if cap is None or not cap.isOpened():
+        return False
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
+    return _read_frame_size(cap, tries=12, require_content=False, pause=0.04) is not None
+
+
+def _release_cap(cap):
+    if cap is None:
+        return
+    try:
+        cap.release()
+    except Exception:
+        pass
+
+
 def _open_capture(index, width=None, height=None):
-    """Open a capture with the platform backend that matches name order."""
+    """
+    Open a capture with the platform backend that matches name order.
+
+    isOpened() can be true on a dead DirectShow handle; try the next backend
+    if the first one cannot actually deliver a frame.
+    """
     system = platform.system()
     backends = []
     if system == "Windows":
@@ -70,16 +126,23 @@ def _open_capture(index, width=None, height=None):
     elif system == "Darwin":
         backends = [cv2.CAP_AVFOUNDATION]
     for be in backends:
-        cap = cv2.VideoCapture(index, be)
-        if cap.isOpened():
-            if width and height:
-                _configure_size(cap, width, height)
+        cap = cv2.VideoCapture(int(index), be)
+        if not cap.isOpened():
+            _release_cap(cap)
+            continue
+        if width and height:
+            _configure_size(cap, width, height)
+        if _warmup_open(cap):
             return cap
-        cap.release()
-    cap = cv2.VideoCapture(index)
-    if cap.isOpened() and width and height:
-        _configure_size(cap, width, height)
-    return cap
+        _release_cap(cap)
+    cap = cv2.VideoCapture(int(index))
+    if cap is not None and cap.isOpened():
+        if width and height:
+            _configure_size(cap, width, height)
+        if _warmup_open(cap):
+            return cap
+    _release_cap(cap)
+    return None
 
 
 def _camera_names_windows():
@@ -157,26 +220,25 @@ def _camera_names_linux():
     return names
 
 
+_names_cache = (None, 0.0)  # (names, monotonic ts)
+
+
 def _platform_camera_names():
+    global _names_cache
+    names, ts = _names_cache
+    if names is not None and (time.monotonic() - ts) < 20:
+        return list(names)
     system = platform.system()
     if system == "Windows":
-        return _camera_names_windows()
-    if system == "Darwin":
-        return _camera_names_macos()
-    if system == "Linux":
-        return _camera_names_linux()
-    return []
-
-
-def _read_frame_size(cap, tries=8):
-    """Return (w, h) from a real frame, or None if the device produces nothing."""
-    for _ in range(tries):
-        ret, frame = cap.read()
-        if ret and frame is not None and getattr(frame, "size", 0):
-            h, w = int(frame.shape[0]), int(frame.shape[1])
-            if w > 0 and h > 0:
-                return (w, h)
-    return None
+        result = _camera_names_windows()
+    elif system == "Darwin":
+        result = _camera_names_macos()
+    elif system == "Linux":
+        result = _camera_names_linux()
+    else:
+        result = []
+    _names_cache = (list(result), time.monotonic())
+    return result
 
 
 def _resolution_matches(requested, actual, tol=0.02):
@@ -195,9 +257,8 @@ def _try_resolution(cap, w, h):
     Ask the driver for (w, h) and verify a frame actually arrives at that size.
     Returns the measured (aw, ah) on success, else None.
     """
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(w))
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(h))
-    size = _read_frame_size(cap, tries=10)
+    _configure_size(cap, w, h)
+    size = _read_frame_size(cap, tries=8, pause=0.02)
     if not size:
         return None
     if _resolution_matches((w, h), size):
@@ -205,18 +266,21 @@ def _try_resolution(cap, w, h):
     return None
 
 
-def probe_camera_resolutions(cap):
+def probe_camera_resolutions(cap, candidates=None):
     """
     Test candidate resolutions by capturing frames.
     Returns ([(w,h), ...], default_(w,h)) or ([], None) if unusable.
     """
     found = {}
 
-    baseline = _read_frame_size(cap, tries=10)
+    baseline = _read_frame_size(cap, tries=16, pause=0.04)
     if baseline:
         found[baseline] = True
 
-    for w, h in _CANDIDATE_RESOLUTIONS:
+    modes = _LIST_RESOLUTIONS if candidates is None else candidates
+    for w, h in modes:
+        if baseline and _resolution_matches((w, h), baseline):
+            continue
         got = _try_resolution(cap, w, h)
         if got:
             found[got] = True
@@ -236,21 +300,19 @@ def probe_camera_resolutions(cap):
         break
 
     # Leave the device parked on a known-good mode.
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, default[0])
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, default[1])
-    _read_frame_size(cap, tries=6)
+    _configure_size(cap, default[0], default[1])
+    _read_frame_size(cap, tries=6, pause=0.02)
     return res_list, default
 
 
 def test_camera_device(index, name=None):
     """
-    Open *index*, verify it can deliver frames, probe resolutions.
+    Open *index*, verify it can deliver frames, probe a small resolution set.
     Returns a catalog entry or None if the camera is unusable.
     """
     cap = _open_capture(int(index))
     if cap is None or not cap.isOpened():
-        if cap is not None:
-            cap.release()
+        _release_cap(cap)
         return None
     try:
         res_list, default = probe_camera_resolutions(cap)
@@ -266,10 +328,7 @@ def test_camera_device(index, name=None):
     except Exception:
         return None
     finally:
-        try:
-            cap.release()
-        except Exception:
-            pass
+        _release_cap(cap)
 
 
 # Last full catalog from /cameras (index -> entry). Used by start() and
@@ -277,9 +336,10 @@ def test_camera_device(index, name=None):
 _device_catalog = {}
 _device_catalog_lock = threading.Lock()
 _enumerate_lock = threading.Lock()
-# Indices already opened for a list probe (success or fail). Never passed to
-# test_camera_device again while reuse_cached is on.
+# Indices that produced a usable catalog entry. Failed opens are retried
+# when we still have no working list (cold plug / first-open warmup).
 _probed_indices = set()
+_failed_indices = set()
 
 
 def _catalog_snapshot():
@@ -325,10 +385,10 @@ def enumerate_cameras(max_probe=10, skip_index=None, skip_entry=None,
     skip_index / skip_entry: camera already held by the live session — do not
     re-open it; reuse the running session's probed list instead.
 
-    reuse_cached: never open an index we already tested (in the catalog or
-    in _probed_indices). Only brand-new indices are passed to
-    test_camera_device. Unplugged indices drop out of the OS name list
-    and are omitted, still without being opened.
+    reuse_cached: never re-open an index already in the catalog. Brand-new
+    indices are probed. Failed opens are retried only when the catalog is
+    still empty (first-open warmup). Unplugged indices drop out of the OS
+    name list and are omitted, still without being opened.
 
     never_probe: extra indices the client already has cached — never opened.
     """
@@ -383,17 +443,23 @@ def _enumerate_cameras_locked(max_probe, skip_index, skip_entry, reuse_cached,
             if reused:
                 out.append(reused)
                 _probed_indices.add(i)
+                _failed_indices.discard(i)
                 continue
-            # Already opened this index (failed or succeeded), or the client
-            # already has it cached. Do not open again.
-            if i in _probed_indices or i in never_probe:
-                _probed_indices.add(i)
+            # Client already has this index cached — do not open it.
+            if i in never_probe:
+                continue
+            # Known-dead only skipped once we already have a working list.
+            # On a cold first open (empty catalog) retry warmup failures.
+            if i in _failed_indices and prev:
                 continue
 
         info = test_camera_device(i, name)
-        _probed_indices.add(i)
         if info:
             out.append(info)
+            _probed_indices.add(i)
+            _failed_indices.discard(i)
+        else:
+            _failed_indices.add(i)
 
     with _device_catalog_lock:
         _device_catalog.clear()
@@ -630,6 +696,7 @@ class _CVState:
         self._last_resolution_ok = True  # False if last change was reverted
         self._camera_name = ""
         self._lifecycle = threading.Lock()
+        self._started_at = 0.0
 
     # -- camera lifecycle --------------------------------------------------
 
@@ -647,12 +714,6 @@ class _CVState:
         with _device_catalog_lock:
             cached = dict(_device_catalog.get(idx) or {})
 
-        cap = _open_capture(idx)
-        if cap is None or not cap.isOpened():
-            if cap is not None:
-                cap.release()
-            return False
-
         # Prefer catalog probe from /cameras; re-test if missing.
         res_list = []
         default = None
@@ -665,18 +726,31 @@ class _CVState:
             d = cached.get("default") or {}
             if int(d.get("width") or 0) > 0 and int(d.get("height") or 0) > 0:
                 default = (int(d["width"]), int(d["height"]))
-        if not res_list or not default:
-            res_list, default = probe_camera_resolutions(cap)
-        if not res_list or not default:
-            cap.release()
+
+        # Open already parked on the known-good size, with MJPG on Windows.
+        if default:
+            cap = _open_capture(idx, default[0], default[1])
+        else:
+            cap = _open_capture(idx)
+        if cap is None or not cap.isOpened():
+            _release_cap(cap)
             return False
 
-        # Park on default and confirm a frame before starting the loop.
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, default[0])
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, default[1])
-        size = _read_frame_size(cap, tries=12)
+        if not res_list or not default:
+            res_list, default = probe_camera_resolutions(
+                cap, candidates=_CANDIDATE_RESOLUTIONS)
+        if not res_list or not default:
+            _release_cap(cap)
+            return False
+
+        # Park on default (MJPG + size) and wait out black warmup frames.
+        _configure_size(cap, default[0], default[1])
+        size = _read_frame_size(
+            cap, tries=24, require_content=True, pause=0.04)
         if not size:
-            cap.release()
+            size = _read_frame_size(cap, tries=8, require_content=False, pause=0.03)
+        if not size:
+            _release_cap(cap)
             return False
 
         self.camera = cap
@@ -687,6 +761,7 @@ class _CVState:
         self._last_resolution_ok = True
         self._pending_resolution = None
         self._resolution_event.set()
+        self._started_at = time.monotonic()
         self.running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -916,6 +991,13 @@ class _CVState:
                 roi = list(self.roi)
 
             processed = self._process(frame, mode, phase, colors, shapes, roi)
+
+            # Hold the JPEG feed until auto-exposure produces a real picture.
+            if (_is_blank_frame(processed)
+                    and (time.monotonic() - self._started_at) < 2.5):
+                elapsed = time.monotonic() - t0
+                time.sleep(max(0.0, target_dt - elapsed))
+                continue
 
             with self.lock:
                 self._processed_frame = processed

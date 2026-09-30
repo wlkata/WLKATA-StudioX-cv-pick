@@ -365,6 +365,23 @@
     }).catch(function () { return null; });
   }
 
+  function delayMs(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  /** Retry a cold first list: backend spawn + camera warmup often miss once. */
+  function loadCamerasRetry(query, attempts) {
+    attempts = attempts || 1;
+    function once(left) {
+      return loadCameras(query).then(function (data) {
+        var ok = data && data.success && data.cameras && data.cameras.length;
+        if (ok || left <= 1) return data;
+        return delayMs(800).then(function () { return once(left - 1); });
+      });
+    }
+    return once(attempts);
+  }
+
   /** Ensure resSelect has option w×h and select it (avoids blank dropdown). */
   function selectResolution(w, h) {
     w = parseInt(w, 10);
@@ -420,10 +437,10 @@
     }).catch(function () {});
   }
 
-  /** Poll /frame until a JPEG arrives or timeout (~8s). */
+  /** Poll /frame until a JPEG arrives or timeout (~12s, covers AE warmup). */
   function waitForFirstFrame() {
     var attempts = 0;
-    var maxAttempts = 40;
+    var maxAttempts = 60;
     return new Promise(function (resolve) {
       function tick() {
         ExtensionAPI.fetch('cv-pick', '/frame').then(function (data) {
@@ -675,7 +692,7 @@
         if (skip.length) q += '&skip=' + encodeURIComponent(skip.join(','));
         load = loadCameras(q);
       } else {
-        load = loadCameras('');
+        load = loadCamerasRetry('', 3);
       }
       return load.then(function (data) {
         if (hadCache && data && data.success) {
