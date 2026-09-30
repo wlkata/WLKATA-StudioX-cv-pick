@@ -25,9 +25,15 @@
   var calibRobotB    = document.getElementById('cvpick-calib-robot-b');
   var calibRecordA   = document.getElementById('cvpick-calib-record-a');
   var calibRecordB   = document.getElementById('cvpick-calib-record-b');
+  var calibGotoA     = document.getElementById('cvpick-calib-goto-a');
+  var calibGotoB     = document.getElementById('cvpick-calib-goto-b');
   var calibPxC       = document.getElementById('cvpick-calib-px-c');
   var calibRobotC    = document.getElementById('cvpick-calib-robot-c');
   var calibRecordC   = document.getElementById('cvpick-calib-record-c');
+  var calibGotoC     = document.getElementById('cvpick-calib-goto-c');
+  var liftInput      = document.getElementById('cvpick-lift-height');
+  var scanOnceBtn    = document.getElementById('cvpick-scan-once');
+  var scanEachBtn    = document.getElementById('cvpick-scan-each');
   var calibSaveBtn   = document.getElementById('cvpick-calib-save');
   var calibStatus    = document.getElementById('cvpick-calib-status');
   var markerA        = document.getElementById('cvpick-marker-a');
@@ -36,6 +42,80 @@
 
   var polling = false;
   var currentMode = 'color';
+  var LIFT_MIN = 1;
+  var LIFT_MAX = 100;
+  var liftHeight = 10;
+  var scanEach = false;
+  var pickRunning = false;
+
+  function clampLift(v) {
+    if (!isFinite(v)) return null;
+    if (v < LIFT_MIN) return LIFT_MIN;
+    if (v > LIFT_MAX) return LIFT_MAX;
+    return v;
+  }
+
+  function savePickSettings() {
+    ExtensionAPI.setData('cv-pick', 'pickSettings', {
+      liftHeight: liftHeight,
+      scanEach: scanEach
+    });
+  }
+
+  function applyLiftHeight(raw, writeInput) {
+    var clamped = clampLift(raw);
+    if (clamped == null) return false;
+    liftHeight = clamped;
+    if (writeInput && liftInput) liftInput.value = String(clamped);
+    savePickSettings();
+    return true;
+  }
+
+  function setScanEach(on) {
+    scanEach = !!on;
+    if (scanOnceBtn) scanOnceBtn.classList.toggle('active', !scanEach);
+    if (scanEachBtn) scanEachBtn.classList.toggle('active', scanEach);
+    savePickSettings();
+  }
+
+  (function loadPickSettings() {
+    var s = ExtensionAPI.getData('cv-pick', 'pickSettings');
+    if (s) {
+      if (s.liftHeight != null) {
+        var lh = clampLift(parseFloat(s.liftHeight));
+        if (lh != null) liftHeight = lh;
+      }
+      if (s.scanEach) scanEach = true;
+    }
+    if (liftInput) liftInput.value = String(liftHeight);
+    if (scanOnceBtn) scanOnceBtn.classList.toggle('active', !scanEach);
+    if (scanEachBtn) scanEachBtn.classList.toggle('active', scanEach);
+  })();
+
+  if (liftInput) {
+    liftInput.addEventListener('input', function () {
+      var raw = parseFloat(this.value);
+      if (!isFinite(raw)) return;
+      if (raw > LIFT_MAX) {
+        this.value = String(LIFT_MAX);
+        applyLiftHeight(LIFT_MAX, false);
+      } else if (raw >= LIFT_MIN) {
+        applyLiftHeight(raw, false);
+      }
+    });
+    liftInput.addEventListener('change', function () {
+      var clamped = clampLift(parseFloat(this.value));
+      if (clamped == null) clamped = liftHeight;
+      this.value = String(clamped);
+      applyLiftHeight(clamped, false);
+    });
+  }
+  if (scanOnceBtn) {
+    scanOnceBtn.addEventListener('click', function () { setScanEach(false); });
+  }
+  if (scanEachBtn) {
+    scanEachBtn.addEventListener('click', function () { setScanEach(true); });
+  }
 
   // ---- robot jog controls -----------------------------------------------
 
@@ -1063,13 +1143,31 @@
     calibRecordA.disabled = !calibState.pixelA;
     calibRecordB.disabled = !calibState.pixelB;
     calibRecordC.disabled = !calibState.pixelC;
+    if (calibGotoA) calibGotoA.disabled = !calibState.robotA || pickRunning;
+    if (calibGotoB) calibGotoB.disabled = !calibState.robotB || pickRunning;
+    if (calibGotoC) calibGotoC.disabled = !calibState.robotC || pickRunning;
     calibSaveBtn.disabled = !(calibState.pixelA && calibState.pixelB && calibState.pixelC
                               && calibState.robotA && calibState.robotB && calibState.robotC);
     updateMarkers();
   }
 
+  function saveCalibPoses() {
+    ExtensionAPI.setData('cv-pick', 'calibPoses', {
+      robotA: calibState.robotA,
+      robotB: calibState.robotB,
+      robotC: calibState.robotC
+    });
+  }
+
   // Load existing calibration on startup
   function loadCalibration() {
+    var savedPoses = ExtensionAPI.getData('cv-pick', 'calibPoses');
+    if (savedPoses) {
+      if (savedPoses.robotA) calibState.robotA = savedPoses.robotA;
+      if (savedPoses.robotB) calibState.robotB = savedPoses.robotB;
+      if (savedPoses.robotC) calibState.robotC = savedPoses.robotC;
+      updateCalibUI();
+    }
     ExtensionAPI.fetch('cv-pick', '/calibration').then(function (data) {
       if (data.success && data.calibration) {
         calibStatus.textContent = 'Calibrated';
@@ -1098,6 +1196,7 @@
       calibState.robotA = null;
       calibState.robotB = null;
       calibState.robotC = null;
+      saveCalibPoses();
       updateCalibUI();
       ExtensionAPI.showNotification(
         'Markers detected: A (red), B (blue), C (green)',
@@ -1121,6 +1220,7 @@
         y: status.coordinates.Y,
         z: status.coordinates.Z
       };
+      saveCalibPoses();
       updateCalibUI();
     });
   });
@@ -1138,6 +1238,7 @@
         y: status.coordinates.Y,
         z: status.coordinates.Z
       };
+      saveCalibPoses();
       updateCalibUI();
     });
   });
@@ -1155,9 +1256,26 @@
         y: status.coordinates.Y,
         z: status.coordinates.Z
       };
+      saveCalibPoses();
       updateCalibUI();
     });
   });
+
+  function gotoCalibPose(pos) {
+    if (!requirePort()) return;
+    if (!pos) return;
+    cmdMove(pos.x, pos.y, pos.z);
+  }
+
+  if (calibGotoA) {
+    calibGotoA.addEventListener('click', function () { gotoCalibPose(calibState.robotA); });
+  }
+  if (calibGotoB) {
+    calibGotoB.addEventListener('click', function () { gotoCalibPose(calibState.robotB); });
+  }
+  if (calibGotoC) {
+    calibGotoC.addEventListener('click', function () { gotoCalibPose(calibState.robotC); });
+  }
 
   // Save calibration
   calibSaveBtn.addEventListener('click', function () {
@@ -1180,7 +1298,8 @@
         calibState.pixelA = null;
         calibState.pixelB = null;
         calibState.pixelC = null;
-        updateMarkers();
+        saveCalibPoses();
+        updateCalibUI();
         ExtensionAPI.showNotification('Calibration saved! Z=' + avgZ.toFixed(1), 'info');
       } else {
         ExtensionAPI.showNotification(data.error || 'Calibration failed', 'error');
@@ -1201,7 +1320,6 @@
   var pickProgress = document.getElementById('cvpick-pick-progress');
 
   var dropPosition = null;   // {x, y, z}
-  var pickRunning  = false;
   var pickAborted  = false;
 
   function updatePickUI() {
@@ -1211,6 +1329,10 @@
       pickOneBtn.disabled = !dropPosition || pickRunning || !pickSelect.value;
     }
     if (pickSelect) pickSelect.disabled = pickRunning;
+    if (liftInput) liftInput.disabled = pickRunning;
+    if (scanOnceBtn) scanOnceBtn.disabled = pickRunning;
+    if (scanEachBtn) scanEachBtn.disabled = pickRunning;
+    updateCalibUI();
   }
 
   function refreshPickTargets() {
@@ -1328,77 +1450,143 @@
     return targets;
   }
 
+  async function fetchPickDetections(groupName) {
+    var det = await ExtensionAPI.fetch('cv-pick', '/detections');
+    var list = (det && det.success && det.detections) ? det.detections : [];
+    if (groupName) {
+      list = list.filter(function (d) { return d.name === groupName; });
+    }
+    return list;
+  }
+
+  async function pickOneObject(target, index, total) {
+    var dz = liftHeight;
+    var d = dropPosition;
+    var t = target.pos;
+    var label = target.name || ('Object ' + index);
+    var suffix = total ? (' (' + index + '/' + total + ')') : (' (' + index + ')');
+    setProgress('Picking ' + label + suffix + '...');
+
+    await cmdMove(t.x, t.y, t.z + dz);
+    await waitIdle();
+    if (pickAborted) return;
+
+    await cmdPump(1);
+    await sleep(300);
+
+    await cmdMove(t.x, t.y, t.z);
+    await waitIdle();
+    if (pickAborted) return;
+    await sleep(200);
+
+    await cmdMove(t.x, t.y, t.z + dz);
+    await waitIdle();
+    if (pickAborted) return;
+
+    setProgress('Dropping ' + label + suffix + '...');
+    await cmdMove(d.x, d.y, d.z + dz);
+    await waitIdle();
+    if (pickAborted) return;
+
+    await cmdMove(d.x, d.y, d.z);
+    await waitIdle();
+    if (pickAborted) return;
+
+    await cmdPump(0);
+    await sleep(300);
+
+    await cmdMove(d.x, d.y, d.z + dz);
+    await waitIdle();
+  }
+
+  function finishPick(picked, total, groupName, aborted) {
+    pickRunning = false;
+    pickStopBtn.disabled = true;
+    updatePickUI();
+
+    if (aborted) {
+      setProgress('Stopped (' + picked + (total ? '/' + total : '') + ' picked)');
+      ExtensionAPI.showNotification('Pick sequence stopped', 'info');
+      return;
+    }
+    var label = groupName || 'objects';
+    var doneMsg = groupName
+      ? ('Done! ' + picked + ' ' + groupName + ' object' + (picked === 1 ? '' : 's') + ' picked')
+      : ('Done! ' + picked + ' objects picked');
+    setProgress(doneMsg);
+    ExtensionAPI.showNotification(
+      groupName ? ('Pick complete: ' + picked + ' ' + label) : ('Pick complete: ' + picked + ' objects'),
+      'info');
+  }
+
   async function runPickSequence(targets) {
     pickRunning = true;
     pickAborted = false;
     updatePickUI();
     pickStopBtn.disabled = false;
 
-    var dz = 10;
-    var d = dropPosition;
-    var j = 0;
-
-    for (; j < targets.length; j++) {
+    var picked = 0;
+    for (var j = 0; j < targets.length; j++) {
       if (pickAborted) break;
-
-      var t = targets[j].pos;
-      var label = targets[j].name || ('Object ' + (j + 1));
-      setProgress('Picking ' + label + ' (' + (j + 1) + '/' + targets.length + ')...');
-
-      await cmdMove(t.x, t.y, t.z + dz);
-      await waitIdle();
+      await pickOneObject(targets[j], j + 1, targets.length);
       if (pickAborted) break;
-
-      await cmdPump(1);
-      await sleep(300);
-
-      await cmdMove(t.x, t.y, t.z);
-      await waitIdle();
-      if (pickAborted) break;
-      await sleep(200);
-
-      await cmdMove(t.x, t.y, t.z + dz);
-      await waitIdle();
-      if (pickAborted) break;
-
-      setProgress('Dropping ' + label + ' (' + (j + 1) + '/' + targets.length + ')...');
-      await cmdMove(d.x, d.y, d.z + dz);
-      await waitIdle();
-      if (pickAborted) break;
-
-      await cmdMove(d.x, d.y, d.z);
-      await waitIdle();
-      if (pickAborted) break;
-
-      await cmdPump(0);
-      await sleep(300);
-
-      await cmdMove(d.x, d.y, d.z + dz);
-      await waitIdle();
-      if (pickAborted) break;
+      picked += 1;
     }
 
     await cmdPump(0);
-    pickRunning = false;
-    pickStopBtn.disabled = true;
-    updatePickUI();
+    var groupName = targets[0] && targets.every(function (t) { return t.name === targets[0].name; })
+      ? targets[0].name : null;
+    finishPick(picked, targets.length, groupName, pickAborted);
+  }
 
-    if (pickAborted) {
-      setProgress('Stopped (' + j + '/' + targets.length + ' picked)');
-      ExtensionAPI.showNotification('Pick sequence stopped', 'info');
-    } else {
-      var groupName = targets[0] && targets[0].name;
-      var sameGroup = groupName && targets.every(function (t) { return t.name === groupName; });
-      var doneMsg = sameGroup
-        ? ('Done! ' + targets.length + ' ' + groupName + ' object' + (targets.length === 1 ? '' : 's') + ' picked')
-        : ('Done! ' + targets.length + ' objects picked');
-      setProgress(doneMsg);
-      ExtensionAPI.showNotification(
-        sameGroup
-          ? ('Pick complete: ' + targets.length + ' ' + groupName)
-          : ('Pick complete: ' + targets.length + ' objects'),
-        'info');
+  async function runPickRetake(groupName) {
+    pickRunning = true;
+    pickAborted = false;
+    updatePickUI();
+    pickStopBtn.disabled = false;
+
+    var picked = 0;
+    while (!pickAborted) {
+      setProgress(picked === 0 ? 'Detecting objects...' : 'Scanning for next object...');
+      if (picked > 0) await sleep(600);
+      var dets = await fetchPickDetections(groupName);
+      if (!dets.length) {
+        if (picked === 0) {
+          pickRunning = false;
+          pickStopBtn.disabled = true;
+          updatePickUI();
+          setProgress('');
+          ExtensionAPI.showNotification(
+            groupName
+              ? ('No "' + groupName + '" objects detected. Switch to Detect mode and ensure they are visible.')
+              : 'No objects detected. Switch to Detect mode and ensure items are visible.',
+            'error');
+          return;
+        }
+        break;
+      }
+      var targets = await detectionsToTargets([dets[0]]);
+      if (!targets.length) {
+        if (picked === 0) {
+          pickRunning = false;
+          pickStopBtn.disabled = true;
+          updatePickUI();
+          setProgress('');
+          ExtensionAPI.showNotification('Could not convert positions — check calibration', 'error');
+          return;
+        }
+        break;
+      }
+      picked += 1;
+      await pickOneObject(targets[0], picked, null);
+      if (pickAborted) {
+        picked -= 1;
+        break;
+      }
     }
+
+    await cmdPump(0);
+    finishPick(picked, 0, groupName || null, pickAborted);
   }
 
   async function ensureCalibrated() {
@@ -1410,19 +1598,28 @@
     return true;
   }
 
-  pickAllBtn.addEventListener('click', async function () {
+  async function startPicking(groupName) {
     if (!requirePort()) return;
     if (!(await ensureCalibrated())) return;
 
-    setProgress('Detecting objects...');
-    var det = await ExtensionAPI.fetch('cv-pick', '/detections');
-    if (!det.success || !det.detections || det.detections.length === 0) {
-      setProgress('');
-      ExtensionAPI.showNotification('No objects detected. Switch to Detect mode and ensure items are visible.', 'error');
+    if (scanEach) {
+      await runPickRetake(groupName);
       return;
     }
 
-    var targets = await detectionsToTargets(det.detections);
+    setProgress(groupName ? ('Detecting ' + groupName + '...') : 'Detecting objects...');
+    var dets = await fetchPickDetections(groupName);
+    if (!dets.length) {
+      setProgress('');
+      ExtensionAPI.showNotification(
+        groupName
+          ? ('No "' + groupName + '" objects detected. Switch to Detect mode and ensure they are visible.')
+          : 'No objects detected. Switch to Detect mode and ensure items are visible.',
+        'error');
+      return;
+    }
+
+    var targets = await detectionsToTargets(dets);
     if (targets.length === 0) {
       setProgress('');
       ExtensionAPI.showNotification('Could not convert positions — check calibration', 'error');
@@ -1430,41 +1627,21 @@
     }
 
     await runPickSequence(targets);
+  }
+
+  pickAllBtn.addEventListener('click', async function () {
+    await startPicking(null);
   });
 
   pickSelect.addEventListener('change', updatePickUI);
 
   pickOneBtn.addEventListener('click', async function () {
-    if (!requirePort()) return;
-    if (!(await ensureCalibrated())) return;
-
     var name = pickSelect.value;
     if (!name) {
       ExtensionAPI.showNotification('Select a group to pick', 'error');
       return;
     }
-
-    setProgress('Detecting ' + name + '...');
-    var det = await ExtensionAPI.fetch('cv-pick', '/detections');
-    var group = ((det && det.success && det.detections) ? det.detections : []).filter(function (d) {
-      return d.name === name;
-    });
-    if (group.length === 0) {
-      setProgress('');
-      ExtensionAPI.showNotification(
-        'No "' + name + '" objects detected. Switch to Detect mode and ensure they are visible.',
-        'error');
-      return;
-    }
-
-    var targets = await detectionsToTargets(group);
-    if (targets.length === 0) {
-      setProgress('');
-      ExtensionAPI.showNotification('Could not convert positions — check calibration', 'error');
-      return;
-    }
-
-    await runPickSequence(targets);
+    await startPicking(name);
   });
 
   pickStopBtn.addEventListener('click', function () {

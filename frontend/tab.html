@@ -39,6 +39,20 @@
         </div>
       </div>
     </div>
+    <div class="cvpick-settings">
+      <h3 class="cvpick-section-title">Settings</h3>
+      <div class="cvpick-settings-row">
+        <label class="cvpick-settings-label" for="cvpick-lift-height">Lift height</label>
+        <input id="cvpick-lift-height" class="cvpick-lift-input" type="number" min="1" max="100" step="1" value="10" title="Height above the object and drop while moving" />
+      </div>
+      <div class="cvpick-settings-row">
+        <span class="cvpick-settings-label">Scan</span>
+        <div class="cvpick-scan-toggle">
+          <button type="button" id="cvpick-scan-once" class="cvpick-scan-btn active" title="Take one picture, then pick every object in that list">One photo</button>
+          <button type="button" id="cvpick-scan-each" class="cvpick-scan-btn" title="Take a picture, pick one object, then take another picture">Each pick</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <div class="cvpick-right">
@@ -112,6 +126,7 @@
           </div>
           <div class="cvpick-calib-robot-row">
             <span id="cvpick-calib-robot-a" class="cvpick-calib-value">—</span>
+            <button id="cvpick-calib-goto-a" class="cvpick-btn-secondary cvpick-calib-record-btn" disabled>Move to</button>
             <button id="cvpick-calib-record-a" class="cvpick-btn-secondary cvpick-calib-record-btn" disabled>Record A</button>
           </div>
         </div>
@@ -122,6 +137,7 @@
           </div>
           <div class="cvpick-calib-robot-row">
             <span id="cvpick-calib-robot-b" class="cvpick-calib-value">—</span>
+            <button id="cvpick-calib-goto-b" class="cvpick-btn-secondary cvpick-calib-record-btn" disabled>Move to</button>
             <button id="cvpick-calib-record-b" class="cvpick-btn-secondary cvpick-calib-record-btn" disabled>Record B</button>
           </div>
         </div>
@@ -132,6 +148,7 @@
           </div>
           <div class="cvpick-calib-robot-row">
             <span id="cvpick-calib-robot-c" class="cvpick-calib-value">—</span>
+            <button id="cvpick-calib-goto-c" class="cvpick-btn-secondary cvpick-calib-record-btn" disabled>Move to</button>
             <button id="cvpick-calib-record-c" class="cvpick-btn-secondary cvpick-calib-record-btn" disabled>Record C</button>
           </div>
         </div>
