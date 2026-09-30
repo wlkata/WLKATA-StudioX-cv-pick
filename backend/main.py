@@ -272,37 +272,126 @@ def test_camera_device(index, name=None):
             pass
 
 
-# Last full catalog from /cameras (index -> entry). Used by start().
+# Last full catalog from /cameras (index -> entry). Used by start() and
+# subsequent list calls so we do not re-open devices we already tested.
 _device_catalog = {}
 _device_catalog_lock = threading.Lock()
+_enumerate_lock = threading.Lock()
+# Indices already opened for a list probe (success or fail). Never passed to
+# test_camera_device again while reuse_cached is on.
+_probed_indices = set()
 
 
-def enumerate_cameras(max_probe=10, skip_index=None, skip_entry=None):
+def _catalog_snapshot():
+    with _device_catalog_lock:
+        return [dict(entry) for _, entry in sorted(_device_catalog.items())]
+
+
+def _catalog_copy():
+    with _device_catalog_lock:
+        return {int(k): dict(v) for k, v in _device_catalog.items()}
+
+
+def _reuse_entry(index, name, prev):
+    """Copy a catalog entry without opening the device. None if unusable."""
+    entry = prev.get(int(index))
+    if not entry or not entry.get("resolutions"):
+        return None
+    out = dict(entry)
+    out["index"] = int(index)
+    if name:
+        out["name"] = name
+    return out
+
+
+def _parse_index_set(raw):
+    out = set()
+    for part in str(raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            continue
+    return out
+
+
+def enumerate_cameras(max_probe=10, skip_index=None, skip_entry=None,
+                      reuse_cached=True, never_probe=None):
     """
     Return usable cameras only: each must produce frames at ≥1 resolution.
 
     skip_index / skip_entry: camera already held by the live session — do not
     re-open it; reuse the running session's probed list instead.
+
+    reuse_cached: never open an index we already tested (in the catalog or
+    in _probed_indices). Only brand-new indices are passed to
+    test_camera_device. Unplugged indices drop out of the OS name list
+    and are omitted, still without being opened.
+
+    never_probe: extra indices the client already has cached — never opened.
     """
+    with _enumerate_lock:
+        return _enumerate_cameras_locked(
+            max_probe=max_probe,
+            skip_index=skip_index,
+            skip_entry=skip_entry,
+            reuse_cached=reuse_cached,
+            never_probe=set(never_probe or ()),
+        )
+
+
+def _enumerate_cameras_locked(max_probe, skip_index, skip_entry, reuse_cached,
+                              never_probe):
     names = _platform_camera_names()
+    prev = _catalog_copy()
+
     if names:
         candidates = [
             (i, (n.strip() if n and str(n).strip() else f"Camera {i}"))
             for i, n in enumerate(names)
+        ]
+    elif reuse_cached and prev:
+        # No OS names: do not rescan empty 0..max_probe slots.
+        candidates = [
+            (i, (prev[i].get("name") or f"Camera {i}"))
+            for i in sorted(prev)
         ]
     else:
         candidates = [(i, f"Camera {i}") for i in range(max_probe)]
 
     out = []
     for i, name in candidates:
+        i = int(i)
         if skip_index is not None and i == int(skip_index):
             if skip_entry and skip_entry.get("resolutions"):
                 entry = dict(skip_entry)
                 entry["index"] = i
                 entry["name"] = entry.get("name") or name
                 out.append(entry)
+                _probed_indices.add(i)
+                continue
+            reused = _reuse_entry(i, name, prev) if reuse_cached else None
+            if reused:
+                out.append(reused)
+                _probed_indices.add(i)
             continue
+
+        if reuse_cached:
+            reused = _reuse_entry(i, name, prev)
+            if reused:
+                out.append(reused)
+                _probed_indices.add(i)
+                continue
+            # Already opened this index (failed or succeeded), or the client
+            # already has it cached. Do not open again.
+            if i in _probed_indices or i in never_probe:
+                _probed_indices.add(i)
+                continue
+
         info = test_camera_device(i, name)
+        _probed_indices.add(i)
         if info:
             out.append(info)
 
@@ -540,14 +629,19 @@ class _CVState:
         self._last_resolution = (0, 0)
         self._last_resolution_ok = True  # False if last change was reverted
         self._camera_name = ""
+        self._lifecycle = threading.Lock()
 
     # -- camera lifecycle --------------------------------------------------
 
     def start(self, camera_index=0):
+        with self._lifecycle:
+            return self._start_body(camera_index)
+
+    def _start_body(self, camera_index=0):
         if self.running:
             if self._camera_index == camera_index:
                 return True
-            self.stop()
+            self._stop_body()
 
         idx = int(camera_index)
         with _device_catalog_lock:
@@ -650,14 +744,27 @@ class _CVState:
         }
 
     def stop(self):
+        with self._lifecycle:
+            self._stop_body()
+
+    def _stop_body(self):
         self.running = False
         self._resolution_event.set()
-        if self._thread:
-            self._thread.join(timeout=3)
-            self._thread = None
-        if self.camera:
-            self.camera.release()
-            self.camera = None
+        thread = self._thread
+        self._thread = None
+        if thread is not None:
+            thread.join(timeout=2.5)
+        cap = self.camera
+        self.camera = None
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+        # DirectShow / AVFoundation keep an exclusive lock briefly after
+        # release(); a short pause avoids the next open seeing "busy".
+        if platform.system() in ("Windows", "Darwin"):
+            time.sleep(0.2)
         with self.lock:
             self._raw_frame = None
             self._processed_frame = None
@@ -1211,16 +1318,37 @@ def list_cameras():
     """
     List only cameras that can deliver frames, each with tested resolutions.
     Entry shape: {index, name, resolutions:[{width,height}], default:{width,height}}
+
+    Default: return the last catalog immediately (no device I/O) when one
+    exists. Pass ?discover=1 to look for newly plugged cameras only — cached
+    devices are not re-opened or re-tested.
     """
+    discover = str(request.args.get("discover") or "").lower() in (
+        "1", "true", "yes",
+    )
+    cached = _catalog_snapshot()
+    if cached and not discover:
+        return jsonify({
+            "success": True,
+            "cameras": cached,
+            "current": _state._camera_index if _state.running else None,
+            "cached": True,
+        })
+
     skip = _state._camera_index if _state.running else None
     skip_entry = _state.catalog_entry() if _state.running else None
     cameras = enumerate_cameras(
-        max_probe=10, skip_index=skip, skip_entry=skip_entry,
+        max_probe=10,
+        skip_index=skip,
+        skip_entry=skip_entry,
+        reuse_cached=True,
+        never_probe=_parse_index_set(request.args.get("skip")),
     )
     return jsonify({
         "success": True,
         "cameras": cameras,
         "current": _state._camera_index if _state.running else None,
+        "cached": False,
     })
 
 

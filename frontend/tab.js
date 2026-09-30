@@ -231,6 +231,12 @@
   var cameraMeta = {};
   /** Last confirmed live resolution key, e.g. "1280x720". */
   var lastGoodResKey = '';
+  /** Last successful /cameras payload — shown instantly on tab re-enter. */
+  var lastCameraPayload = null;
+  /** In-flight /stop; re-enter waits so the device is actually released. */
+  var stopPromise = Promise.resolve();
+  /** Bumped on each activate/deactivate so stale list requests skip UI. */
+  var listRequestId = 0;
 
   /**
    * Show the full-area cover over the feed (hides ROI / blank frame).
@@ -308,9 +314,53 @@
     }
   }
 
-  function loadCameras() {
-    return ExtensionAPI.fetch('cv-pick', '/cameras').then(function (data) {
-      populateCameras(data);
+  function applyCameraList(data) {
+    if (!data || !data.success) return false;
+    lastCameraPayload = data;
+    populateCameras(data);
+    return !!(data.cameras && data.cameras.length);
+  }
+
+  function cachedCameraIndices() {
+    var cams = (lastCameraPayload && lastCameraPayload.cameras) || [];
+    var ids = [];
+    for (var i = 0; i < cams.length; i++) {
+      var cam = cams[i];
+      var idx = (cam && typeof cam === 'object') ? cam.index : cam;
+      if (idx === undefined || idx === null || idx === '') continue;
+      ids.push(String(idx));
+    }
+    return ids;
+  }
+
+  function mergeCameraPayload(prev, fresh) {
+    if (!fresh || !fresh.success) return prev;
+    if (!prev || !prev.cameras || !prev.cameras.length) return fresh;
+    var byIndex = {};
+    function put(cam) {
+      var idx = (cam && typeof cam === 'object') ? cam.index : cam;
+      if (idx === undefined || idx === null || idx === '') return;
+      byIndex[String(idx)] = (cam && typeof cam === 'object')
+        ? cam
+        : { index: idx, name: 'Camera ' + idx };
+    }
+    (prev.cameras || []).forEach(put);
+    (fresh.cameras || []).forEach(put);
+    var cameras = Object.keys(byIndex).sort(function (a, b) {
+      return parseInt(a, 10) - parseInt(b, 10);
+    }).map(function (k) { return byIndex[k]; });
+    return {
+      success: true,
+      cameras: cameras,
+      current: (fresh.current != null && fresh.current !== undefined)
+        ? fresh.current
+        : prev.current
+    };
+  }
+
+  function loadCameras(query) {
+    var path = '/cameras' + (query || '');
+    return ExtensionAPI.fetch('cv-pick', path).then(function (data) {
       return data;
     }).catch(function () { return null; });
   }
@@ -452,11 +502,17 @@
     });
   }
 
+  function releaseCameraBackend() {
+    stopPromise = ExtensionAPI.fetch('cv-pick', '/stop', { method: 'POST' })
+      .catch(function () { return null; });
+    return stopPromise;
+  }
+
   function stopCameraStream() {
     polling = false;
     cameraRunning = false;
     updateStartBtn();
-    ExtensionAPI.fetch('cv-pick', '/stop', { method: 'POST' }).catch(function () {});
+    releaseCameraBackend();
     if (resSelect) resSelect.innerHTML = '';
     setIdlePlaceholder('Select a camera and click Start');
     setCameraBusy(false);
@@ -564,11 +620,31 @@
 
   var refreshTimer = null;
 
+  function showListResult(data, hadCache) {
+    setCameraBusy(false);
+    if (data && data.success) {
+      applyCameraList(data);
+      if (!data.cameras || !data.cameras.length) {
+        setPlaceholder('No cameras found', false);
+      } else {
+        setIdlePlaceholder('Select a camera and click Start');
+      }
+    } else if (!hadCache) {
+      setPlaceholder('Could not list cameras', false);
+    }
+    refreshLearned();
+  }
+
   /**
-   * Tab open / return from another tab:
-   * refresh camera list (plug/unplug) and stay idle until Start.
+   * Tab open / return from another tab.
+   * If we already listed cameras, paint that list immediately and look for
+   * newly plugged devices in the background (cached devices are not re-tested).
    */
   function prepareCameraTab() {
+    var req = ++listRequestId;
+    var hadCache = !!(lastCameraPayload && lastCameraPayload.cameras &&
+      lastCameraPayload.cameras.length);
+
     ExtensionAPI.fetch('cv-pick', '/roi').then(function (data) {
       if (data.success && data.roi && data.roi.length === 4) {
         roi.x1 = data.roi[0]; roi.y1 = data.roi[1];
@@ -576,29 +652,46 @@
       }
     }).catch(function () {});
 
-    // Leaving the tab stops the stream; always re-enter idle and refresh list.
     cameraRunning = false;
     polling = false;
     updateStartBtn();
     if (resSelect) resSelect.innerHTML = '';
 
-    setCameraBusy(true);
-    setPlaceholder('Loading camera list\u2026', true);
+    if (hadCache) {
+      applyCameraList(lastCameraPayload);
+      setCameraBusy(false);
+      setIdlePlaceholder('Select a camera and click Start');
+    } else {
+      setCameraBusy(true);
+      setPlaceholder('Loading camera list\u2026', true);
+    }
 
-    loadCameras().then(function (data) {
-      setCameraBusy(false);
-      if (!data || !data.success) {
-        setPlaceholder('Could not list cameras', false);
-      } else if (!data.cameras || !data.cameras.length) {
-        setPlaceholder('No cameras found', false);
+    function afterStop() {
+      if (req !== listRequestId) return;
+      var load;
+      if (hadCache) {
+        var skip = cachedCameraIndices();
+        var q = '?discover=1';
+        if (skip.length) q += '&skip=' + encodeURIComponent(skip.join(','));
+        load = loadCameras(q);
       } else {
-        setIdlePlaceholder('Select a camera and click Start');
+        load = loadCameras('');
       }
-      refreshLearned();
-    }).catch(function () {
-      setCameraBusy(false);
-      setPlaceholder('Backend not reachable', false);
-    });
+      return load.then(function (data) {
+        if (hadCache && data && data.success) {
+          data = mergeCameraPayload(lastCameraPayload, data);
+        }
+        if (data && data.success) lastCameraPayload = data;
+        if (req !== listRequestId) return;
+        showListResult(data, hadCache);
+      }).catch(function () {
+        if (req !== listRequestId) return;
+        setCameraBusy(false);
+        if (!hadCache) setPlaceholder('Backend not reachable', false);
+      });
+    }
+
+    (stopPromise || Promise.resolve()).then(afterStop).catch(afterStop);
 
     if (!refreshTimer) {
       refreshTimer = setInterval(refreshLearned, 3000);
@@ -611,11 +704,13 @@
     updateStartBtn();
     setCameraBusy(false);
     hideOverlays();
-    ExtensionAPI.fetch('cv-pick', '/stop', { method: 'POST' }).catch(function () {});
+    listRequestId += 1;
     if (refreshTimer) {
       clearInterval(refreshTimer);
       refreshTimer = null;
     }
+    // Release the device before another tab (or a later re-enter) opens it.
+    releaseCameraBackend();
   }
 
   // Lifecycle: list cameras on enter; release device when leaving
