@@ -504,8 +504,14 @@
   gap: 6px;
   flex-wrap: wrap;
 }
-.cvpick-calib-robot-row .cvpick-calib-value {
+.cvpick-calib-pose {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
   flex: 1;
+}
+.cvpick-calib-pose .cvpick-calib-value {
   min-width: 0;
 }
 .cvpick-calib-record-btn {

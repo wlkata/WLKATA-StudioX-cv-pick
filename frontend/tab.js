@@ -1143,9 +1143,18 @@
     calibRecordA.disabled = !calibState.pixelA;
     calibRecordB.disabled = !calibState.pixelB;
     calibRecordC.disabled = !calibState.pixelC;
-    if (calibGotoA) calibGotoA.disabled = !calibState.robotA || pickRunning;
-    if (calibGotoB) calibGotoB.disabled = !calibState.robotB || pickRunning;
-    if (calibGotoC) calibGotoC.disabled = !calibState.robotC || pickRunning;
+    if (calibGotoA) {
+      calibGotoA.hidden = !calibState.robotA;
+      calibGotoA.disabled = !calibState.robotA || pickRunning;
+    }
+    if (calibGotoB) {
+      calibGotoB.hidden = !calibState.robotB;
+      calibGotoB.disabled = !calibState.robotB || pickRunning;
+    }
+    if (calibGotoC) {
+      calibGotoC.hidden = !calibState.robotC;
+      calibGotoC.disabled = !calibState.robotC || pickRunning;
+    }
     calibSaveBtn.disabled = !(calibState.pixelA && calibState.pixelB && calibState.pixelC
                               && calibState.robotA && calibState.robotB && calibState.robotC);
     updateMarkers();
