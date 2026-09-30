@@ -854,7 +854,10 @@
     (stopPromise || Promise.resolve()).then(afterStop).catch(afterStop);
 
     if (!refreshTimer) {
-      refreshTimer = setInterval(refreshLearned, 3000);
+      refreshTimer = setInterval(function () {
+        refreshLearned();
+        refreshPickTargets();
+      }, 3000);
     }
   }
 
@@ -892,6 +895,7 @@
       body: JSON.stringify({ mode: mode })
     });
     refreshLearned();
+    refreshPickTargets();
   }
 
   colorBtn.addEventListener('click', function () { setMode('color'); });
@@ -1174,6 +1178,8 @@
   var dropSetBtn   = document.getElementById('cvpick-drop-set');
   var dropPosEl    = document.getElementById('cvpick-drop-pos');
   var pickAllBtn   = document.getElementById('cvpick-pick-all');
+  var pickOneBtn   = document.getElementById('cvpick-pick-one');
+  var pickSelect   = document.getElementById('cvpick-pick-select');
   var pickStopBtn  = document.getElementById('cvpick-pick-stop');
   var pickProgress = document.getElementById('cvpick-pick-progress');
 
@@ -1184,6 +1190,46 @@
   function updatePickUI() {
     dropPosEl.textContent = dropPosition ? fmtRobot(dropPosition) : '\u2014';
     pickAllBtn.disabled = !dropPosition || pickRunning;
+    if (pickOneBtn) {
+      pickOneBtn.disabled = !dropPosition || pickRunning || !pickSelect.value;
+    }
+    if (pickSelect) pickSelect.disabled = pickRunning;
+  }
+
+  function refreshPickTargets() {
+    if (pickRunning || !pickSelect) return;
+    Promise.all([
+      ExtensionAPI.fetch('cv-pick', '/learned'),
+      ExtensionAPI.fetch('cv-pick', '/detections')
+    ]).then(function (results) {
+      if (pickRunning) return;
+      var learned = (results[0] && results[0].success && results[0].items) ? results[0].items : [];
+      var dets = (results[1] && results[1].success && results[1].detections) ? results[1].detections : [];
+      var prev = pickSelect.value;
+
+      var names = [];
+      learned.forEach(function (item) {
+        if (item.mode !== currentMode) return;
+        if (item.name && names.indexOf(item.name) === -1) names.push(item.name);
+      });
+
+      var counts = {};
+      dets.forEach(function (d) {
+        var n = d.name;
+        if (!n) return;
+        counts[n] = (counts[n] || 0) + 1;
+      });
+
+      pickSelect.innerHTML = '<option value="">-- select group --</option>';
+      names.forEach(function (name) {
+        var opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = counts[name] ? (name + ' (' + counts[name] + ')') : name;
+        pickSelect.appendChild(opt);
+      });
+      if (prev) pickSelect.value = prev;
+      updatePickUI();
+    }).catch(function () {});
   }
 
   // Restore saved drop position
@@ -1250,104 +1296,72 @@
     pickProgress.classList.toggle('running', !!msg);
   }
 
-  // Pick all sequence
-  pickAllBtn.addEventListener('click', async function () {
-    if (!requirePort()) return;
-
-    // Verify calibration exists
-    var calData = await ExtensionAPI.fetch('cv-pick', '/calibration');
-    if (!calData.success || !calData.calibration) {
-      ExtensionAPI.showNotification('Calibrate first before picking', 'error');
-      return;
-    }
-
-    // Detect all objects
-    setProgress('Detecting objects...');
-    var det = await ExtensionAPI.fetch('cv-pick', '/detections');
-    if (!det.success || !det.detections || det.detections.length === 0) {
-      setProgress('');
-      ExtensionAPI.showNotification('No objects detected. Switch to Detect mode and ensure items are visible.', 'error');
-      return;
-    }
-
-    // Convert all pixel positions to robot coords
+  async function detectionsToTargets(detections) {
     var targets = [];
-    for (var i = 0; i < det.detections.length; i++) {
-      var px = det.detections[i].center_px;
+    for (var i = 0; i < detections.length; i++) {
+      var px = detections[i].center_px;
       var pos = await ExtensionAPI.fetch('cv-pick', '/pick-position', {
         method: 'POST',
         body: JSON.stringify({ px: px[0], py: px[1] })
       });
       if (pos.success) {
-        targets.push({ name: det.detections[i].name, pos: pos.position });
+        targets.push({ name: detections[i].name, pos: pos.position });
       }
     }
+    return targets;
+  }
 
-    if (targets.length === 0) {
-      setProgress('');
-      ExtensionAPI.showNotification('Could not convert positions — check calibration', 'error');
-      return;
-    }
-
-    // Start pick loop
+  async function runPickSequence(targets) {
     pickRunning = true;
     pickAborted = false;
-    pickAllBtn.disabled = true;
+    updatePickUI();
     pickStopBtn.disabled = false;
 
     var dz = 10;
     var d = dropPosition;
+    var j = 0;
 
-    for (var j = 0; j < targets.length; j++) {
+    for (; j < targets.length; j++) {
       if (pickAborted) break;
 
       var t = targets[j].pos;
       var label = targets[j].name || ('Object ' + (j + 1));
       setProgress('Picking ' + label + ' (' + (j + 1) + '/' + targets.length + ')...');
 
-      // Move above target
       await cmdMove(t.x, t.y, t.z + dz);
       await waitIdle();
       if (pickAborted) break;
 
-      // Pump on
       await cmdPump(1);
       await sleep(300);
 
-      // Lower to pick
       await cmdMove(t.x, t.y, t.z);
       await waitIdle();
       if (pickAborted) break;
       await sleep(200);
 
-      // Lift up
       await cmdMove(t.x, t.y, t.z + dz);
       await waitIdle();
       if (pickAborted) break;
 
-      // Move to drop position (above)
       setProgress('Dropping ' + label + ' (' + (j + 1) + '/' + targets.length + ')...');
       await cmdMove(d.x, d.y, d.z + dz);
       await waitIdle();
       if (pickAborted) break;
 
-      // Lower to drop
       await cmdMove(d.x, d.y, d.z);
       await waitIdle();
       if (pickAborted) break;
 
-      // Pump off
       await cmdPump(0);
       await sleep(300);
 
-      // Lift up from drop
       await cmdMove(d.x, d.y, d.z + dz);
       await waitIdle();
       if (pickAborted) break;
     }
 
-    // Done
-    await cmdPump(0);  // ensure pump off
+    await cmdPump(0);
     pickRunning = false;
     pickStopBtn.disabled = true;
     updatePickUI();
@@ -1356,18 +1370,93 @@
       setProgress('Stopped (' + j + '/' + targets.length + ' picked)');
       ExtensionAPI.showNotification('Pick sequence stopped', 'info');
     } else {
-      setProgress('Done! ' + targets.length + ' objects picked');
-      ExtensionAPI.showNotification('Pick complete: ' + targets.length + ' objects', 'info');
+      var groupName = targets[0] && targets[0].name;
+      var sameGroup = groupName && targets.every(function (t) { return t.name === groupName; });
+      var doneMsg = sameGroup
+        ? ('Done! ' + targets.length + ' ' + groupName + ' object' + (targets.length === 1 ? '' : 's') + ' picked')
+        : ('Done! ' + targets.length + ' objects picked');
+      setProgress(doneMsg);
+      ExtensionAPI.showNotification(
+        sameGroup
+          ? ('Pick complete: ' + targets.length + ' ' + groupName)
+          : ('Pick complete: ' + targets.length + ' objects'),
+        'info');
     }
+  }
+
+  async function ensureCalibrated() {
+    var calData = await ExtensionAPI.fetch('cv-pick', '/calibration');
+    if (!calData.success || !calData.calibration) {
+      ExtensionAPI.showNotification('Calibrate first before picking', 'error');
+      return false;
+    }
+    return true;
+  }
+
+  pickAllBtn.addEventListener('click', async function () {
+    if (!requirePort()) return;
+    if (!(await ensureCalibrated())) return;
+
+    setProgress('Detecting objects...');
+    var det = await ExtensionAPI.fetch('cv-pick', '/detections');
+    if (!det.success || !det.detections || det.detections.length === 0) {
+      setProgress('');
+      ExtensionAPI.showNotification('No objects detected. Switch to Detect mode and ensure items are visible.', 'error');
+      return;
+    }
+
+    var targets = await detectionsToTargets(det.detections);
+    if (targets.length === 0) {
+      setProgress('');
+      ExtensionAPI.showNotification('Could not convert positions — check calibration', 'error');
+      return;
+    }
+
+    await runPickSequence(targets);
   });
 
-  // Stop button
+  pickSelect.addEventListener('change', updatePickUI);
+
+  pickOneBtn.addEventListener('click', async function () {
+    if (!requirePort()) return;
+    if (!(await ensureCalibrated())) return;
+
+    var name = pickSelect.value;
+    if (!name) {
+      ExtensionAPI.showNotification('Select a group to pick', 'error');
+      return;
+    }
+
+    setProgress('Detecting ' + name + '...');
+    var det = await ExtensionAPI.fetch('cv-pick', '/detections');
+    var group = ((det && det.success && det.detections) ? det.detections : []).filter(function (d) {
+      return d.name === name;
+    });
+    if (group.length === 0) {
+      setProgress('');
+      ExtensionAPI.showNotification(
+        'No "' + name + '" objects detected. Switch to Detect mode and ensure they are visible.',
+        'error');
+      return;
+    }
+
+    var targets = await detectionsToTargets(group);
+    if (targets.length === 0) {
+      setProgress('');
+      ExtensionAPI.showNotification('Could not convert positions — check calibration', 'error');
+      return;
+    }
+
+    await runPickSequence(targets);
+  });
+
   pickStopBtn.addEventListener('click', function () {
     pickAborted = true;
     pickStopBtn.disabled = true;
     setProgress('Stopping...');
-    cmdPump(0);  // turn off pump immediately
+    cmdPump(0);
   });
 
   updatePickUI();
+  refreshPickTargets();
 })();

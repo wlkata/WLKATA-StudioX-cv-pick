@@ -456,6 +456,17 @@
 }
 .cvpick-pick-drop-row .cvpick-calib-label { flex-shrink: 0; }
 .cvpick-pick-drop-row .cvpick-calib-value { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.cvpick-pick-one-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.cvpick-pick-one-row .cvpick-select { flex: 1; }
+.cvpick-pick-one-row .cvpick-btn-primary {
+  flex: 0 0 auto;
+  padding: 6px 12px;
+}
 .cvpick-pick-actions {
   display: flex;
   gap: 8px;
