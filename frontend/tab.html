@@ -46,9 +46,10 @@
         <input id="cvpick-lift-height" class="cvpick-lift-input" type="number" min="1" max="100" step="1" value="10" title="Height above the object and drop while moving" />
       </div>
       <div class="cvpick-settings-row">
-        <div class="cvpick-scan-toggle">
-          <button type="button" id="cvpick-scan-once" class="cvpick-scan-btn active" title="Detect all objects once, then pick that list">Scan once</button>
-          <button type="button" id="cvpick-scan-each" class="cvpick-scan-btn" title="Detect, pick one object, then detect again">Scan each pick</button>
+        <span class="cvpick-settings-label">Scan</span>
+        <div class="cvpick-scan-switch" role="group" aria-label="Scan mode">
+          <button type="button" id="cvpick-scan-once" class="cvpick-scan-btn active" title="Detect all objects once, then pick that list">Once</button>
+          <button type="button" id="cvpick-scan-each" class="cvpick-scan-btn" title="Detect, pick one object, then detect again">Each pick</button>
         </div>
       </div>
     </div>

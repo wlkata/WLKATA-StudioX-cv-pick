@@ -181,20 +181,23 @@
 .cvpick-lift-input:disabled {
   opacity: 0.55;
 }
-.cvpick-scan-toggle {
-  display: flex;
-  align-items: center;
-  gap: 6px;
+.cvpick-scan-switch {
+  display: inline-flex;
+  align-items: stretch;
+  padding: 2px;
+  border-radius: 6px;
+  background: var(--bg-secondary, #f0f0f0);
 }
 .cvpick-scan-btn {
-  padding: 5px 10px;
+  padding: 4px 10px;
   border: none;
-  border-radius: 6px;
-  background: var(--bg-secondary, #f5f5f5);
-  color: var(--text-primary, #333);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary, #666);
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
+  line-height: 1.2;
 }
 .cvpick-scan-btn.active {
   background: var(--accent, #2196F3);
