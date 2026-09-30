@@ -590,10 +590,6 @@
 .cvpick-jog-step-input.custom-active {
   border-color: var(--accent, #2196F3);
 }
-.cvpick-jog-unit {
-  font-size: 10px;
-  color: var(--text-muted, #999);
-}
 .cvpick-jog-pump-row {
   display: flex;
   gap: 4px;

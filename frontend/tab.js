@@ -87,22 +87,32 @@
   loadRobots();
   ExtensionAPI.onActivate('cv-pick', loadRobots);
 
-  // Step selector (presets + custom mm)
+  // Step selector (presets + custom 1–50)
+  var STEP_MIN = 1;
+  var STEP_MAX = 50;
   var stepBtns = document.querySelectorAll('.cvpick-jog-step');
   var stepInput = document.getElementById('cvpick-jog-step-custom');
 
+  function clampJogStep(step) {
+    if (!isFinite(step)) return null;
+    if (step < STEP_MIN) return STEP_MIN;
+    if (step > STEP_MAX) return STEP_MAX;
+    return step;
+  }
+
   function applyJogStep(step, fromPreset) {
-    if (!(step > 0) || !isFinite(step)) return false;
-    jogStep = step;
+    var clamped = clampJogStep(step);
+    if (clamped == null) return false;
+    jogStep = clamped;
     var matched = false;
     for (var k = 0; k < stepBtns.length; k++) {
       var btnStep = parseFloat(stepBtns[k].getAttribute('data-step'));
-      var on = btnStep === step;
+      var on = btnStep === clamped;
       stepBtns[k].classList.toggle('active', on);
       if (on) matched = true;
     }
     if (stepInput) {
-      if (fromPreset) stepInput.value = String(step);
+      if (fromPreset) stepInput.value = String(clamped);
       stepInput.classList.toggle('custom-active', !matched);
     }
     return true;
@@ -115,13 +125,20 @@
   }
   if (stepInput) {
     stepInput.addEventListener('input', function () {
-      applyJogStep(parseFloat(this.value), false);
+      var raw = parseFloat(this.value);
+      if (!isFinite(raw)) return;
+      if (raw > STEP_MAX) {
+        this.value = String(STEP_MAX);
+        applyJogStep(STEP_MAX, false);
+      } else if (raw >= STEP_MIN) {
+        applyJogStep(raw, false);
+      }
     });
     stepInput.addEventListener('change', function () {
-      if (!applyJogStep(parseFloat(this.value), false)) {
-        this.value = String(jogStep);
-        applyJogStep(jogStep, false);
-      }
+      var clamped = clampJogStep(parseFloat(this.value));
+      if (clamped == null) clamped = jogStep;
+      this.value = String(clamped);
+      applyJogStep(clamped, false);
     });
   }
 
