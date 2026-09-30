@@ -479,6 +479,18 @@
   padding-bottom: 12px;
   border-bottom: 1px solid var(--border-primary, #eee);
 }
+.cvpick-device-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.cvpick-refresh-btn {
+  padding: 4px 8px;
+  font-size: 14px;
+  line-height: 1;
+  flex-shrink: 0;
+}
 .cvpick-jog-axes {
   display: flex;
   gap: 8px;

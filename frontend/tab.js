@@ -42,6 +42,50 @@
   var jogStep = 5;
   var jogBusy = false;
   var pumpOn  = false;
+  var selectedPort = ExtensionAPI.getData('cv-pick', 'selectedPort') || null;
+  var robotSelect  = document.getElementById('cvpick-robot-select');
+  var robotRefresh = document.getElementById('cvpick-robot-refresh');
+
+  function withPort(body) {
+    if (selectedPort) body.port = selectedPort;
+    return body;
+  }
+
+  function requirePort() {
+    if (selectedPort) return selectedPort;
+    ExtensionAPI.showNotification('Select a robotic arm first', 'error');
+    return null;
+  }
+
+  function loadRobots() {
+    ExtensionAPI.getDevices().then(function (data) {
+      if (!data.success || !data.ports) return;
+      var prev = selectedPort || robotSelect.value;
+      robotSelect.innerHTML = '<option value="">-- select a robot --</option>';
+      data.ports.forEach(function (d) {
+        if (!d.connected) return;
+        var opt = document.createElement('option');
+        opt.value = d.port;
+        opt.textContent = d.model + ' (' + d.port + ')';
+        robotSelect.appendChild(opt);
+      });
+      if (prev) robotSelect.value = prev;
+      if (!robotSelect.value) {
+        var def = ExtensionAPI.pickDefaultPort(data.ports);
+        if (def) robotSelect.value = def;
+      }
+      selectedPort = robotSelect.value || null;
+      if (selectedPort) ExtensionAPI.setData('cv-pick', 'selectedPort', selectedPort);
+    }).catch(function () {});
+  }
+
+  robotSelect.addEventListener('change', function () {
+    selectedPort = robotSelect.value || null;
+    ExtensionAPI.setData('cv-pick', 'selectedPort', selectedPort);
+  });
+  robotRefresh.addEventListener('click', loadRobots);
+  loadRobots();
+  ExtensionAPI.onActivate('cv-pick', loadRobots);
 
   // Step selector
   var stepBtns = document.querySelectorAll('.cvpick-jog-step');
@@ -58,6 +102,7 @@
   for (var ji = 0; ji < jogBtns.length; ji++) {
     jogBtns[ji].addEventListener('click', function () {
       if (jogBusy) return;
+      if (!requirePort()) return;
       var axis = this.getAttribute('data-axis').toUpperCase();
       var dir  = parseInt(this.getAttribute('data-dir'), 10);
       jogBusy = true;
@@ -65,7 +110,7 @@
       fetch(ExtensionAPI.getServerUrl() + '/cmd/jog', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: 'coord', axis: axis, step: dir * jogStep })
+        body: JSON.stringify(withPort({ mode: 'coord', axis: axis, step: dir * jogStep }))
       }).then(function () { jogBusy = false; })
         .catch(function () { jogBusy = false; });
     });
@@ -75,12 +120,14 @@
   var pumpOnBtn  = document.getElementById('cvpick-pump-on');
   var pumpOffBtn = document.getElementById('cvpick-pump-off');
   pumpOnBtn.addEventListener('click', function () {
+    if (!requirePort()) return;
     cmdPump(1);
     pumpOn = true;
     pumpOnBtn.classList.add('pump-active');
     pumpOffBtn.classList.remove('pump-active');
   });
   pumpOffBtn.addEventListener('click', function () {
+    if (!requirePort()) return;
     cmdPump(0);
     pumpOn = false;
     pumpOffBtn.classList.add('pump-active');
@@ -1014,7 +1061,8 @@
 
   // Record robot position for point A
   calibRecordA.addEventListener('click', function () {
-    ExtensionAPI.getRobotStatus().then(function (status) {
+    if (!requirePort()) return;
+    ExtensionAPI.getRobotStatus(selectedPort).then(function (status) {
       if (!status.success) {
         ExtensionAPI.showNotification(status.error || 'Cannot read robot position', 'error');
         return;
@@ -1030,7 +1078,8 @@
 
   // Record robot position for point B
   calibRecordB.addEventListener('click', function () {
-    ExtensionAPI.getRobotStatus().then(function (status) {
+    if (!requirePort()) return;
+    ExtensionAPI.getRobotStatus(selectedPort).then(function (status) {
       if (!status.success) {
         ExtensionAPI.showNotification(status.error || 'Cannot read robot position', 'error');
         return;
@@ -1046,7 +1095,8 @@
 
   // Record robot position for point C
   calibRecordC.addEventListener('click', function () {
-    ExtensionAPI.getRobotStatus().then(function (status) {
+    if (!requirePort()) return;
+    ExtensionAPI.getRobotStatus(selectedPort).then(function (status) {
       if (!status.success) {
         ExtensionAPI.showNotification(status.error || 'Cannot read robot position', 'error');
         return;
@@ -1117,7 +1167,8 @@
 
   // Set drop position from current robot position
   dropSetBtn.addEventListener('click', function () {
-    ExtensionAPI.getRobotStatus().then(function (status) {
+    if (!requirePort()) return;
+    ExtensionAPI.getRobotStatus(selectedPort).then(function (status) {
       if (!status.success) {
         ExtensionAPI.showNotification(status.error || 'Cannot read robot position', 'error');
         return;
@@ -1144,7 +1195,7 @@
     return fetch(_serverUrl + '/cmd/jog', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: 'coord', motion: 1, values: { x: x, y: y, z: z }, isAbsolute: true })
+      body: JSON.stringify(withPort({ mode: 'coord', motion: 1, values: { x: x, y: y, z: z }, isAbsolute: true }))
     });
   }
 
@@ -1152,7 +1203,7 @@
     return fetch(_serverUrl + '/cmd/pump', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: mode })
+      body: JSON.stringify(withPort({ mode: mode }))
     });
   }
 
@@ -1160,7 +1211,7 @@
     var deadline = Date.now() + (timeoutMs || 15000);
     while (Date.now() < deadline) {
       if (pickAborted) return;
-      var st = await ExtensionAPI.getRobotStatus();
+      var st = await ExtensionAPI.getRobotStatus(selectedPort);
       if (st.success && st.state === 'Idle') return;
       await sleep(200);
     }
@@ -1173,6 +1224,8 @@
 
   // Pick all sequence
   pickAllBtn.addEventListener('click', async function () {
+    if (!requirePort()) return;
+
     // Verify calibration exists
     var calData = await ExtensionAPI.fetch('cv-pick', '/calibration');
     if (!calData.success || !calData.calibration) {
