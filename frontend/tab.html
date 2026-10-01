@@ -56,11 +56,18 @@
         </div>
       </div>
       <div id="cvpick-yolo-settings" class="cvpick-yolo-settings" hidden>
-        <input id="cvpick-model-file" type="file" accept=".pt,.ckpt" hidden />
-        <button type="button" id="cvpick-model-browse" class="cvpick-model-btn">Choose</button>
-        <span id="cvpick-model-filename" class="cvpick-model-filename">No file</span>
-        <button type="button" id="cvpick-load-btn" class="cvpick-model-btn cvpick-model-btn-primary" disabled>Load</button>
-        <button type="button" id="cvpick-unload-btn" class="cvpick-model-btn">Unload</button>
+        <div class="cvpick-yolo-title">YOLO</div>
+        <div class="cvpick-yolo-row">
+          <input id="cvpick-model-file" type="file" accept=".pt,.ckpt" hidden />
+          <button type="button" id="cvpick-model-browse" class="cvpick-model-btn" title="Select a local YOLO26n .pt or .ckpt file">Select checkpoint</button>
+          <span id="cvpick-model-filename" class="cvpick-model-filename" title="No file">No file</span>
+        </div>
+        <div class="cvpick-yolo-row">
+          <button type="button" id="cvpick-load-btn" class="cvpick-model-btn cvpick-model-btn-primary" disabled>Load</button>
+          <button type="button" id="cvpick-unload-btn" class="cvpick-model-btn">Unload</button>
+          <label class="cvpick-settings-label" for="cvpick-yolo-conf">Threshold</label>
+          <input id="cvpick-yolo-conf" class="cvpick-lift-input cvpick-yolo-conf" type="number" min="0.05" max="0.95" step="0.05" value="0.25" title="Minimum detection confidence (0.05–0.95)" />
+        </div>
       </div>
     </div>
   </div>

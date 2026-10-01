@@ -144,8 +144,8 @@
 /* ---- settings panel ---- */
 .cvpick-settings {
   display: flex;
-  align-items: center;
-  gap: 16px;
+  align-items: flex-start;
+  gap: 12px;
   margin-top: 10px;
   padding: 10px 12px 12px;
   border: 1px solid var(--border-primary, #ccc);
@@ -154,7 +154,8 @@
   flex-shrink: 0;
 }
 .cvpick-settings-main {
-  flex: 0 0 auto;
+  flex: 1;
+  min-width: 0;
 }
 .cvpick-settings .cvpick-section-title {
   margin-bottom: 6px;
@@ -334,11 +335,27 @@
 }
 .cvpick-yolo-settings:not([hidden]) {
   display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-left: auto;
+  flex: 0 0 auto;
+  max-width: 280px;
+  padding: 6px 8px 8px;
+  border: 1px solid var(--border-primary, #ccc);
+  border-radius: 6px;
+  background: var(--bg-primary, #fff);
+  box-sizing: border-box;
+}
+.cvpick-yolo-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-primary, #333);
+}
+.cvpick-yolo-row {
+  display: flex;
   align-items: center;
-  flex-wrap: wrap;
   gap: 6px;
   min-width: 0;
-  flex: 1;
 }
 .cvpick-model-btn {
   padding: 3px 8px;
@@ -360,13 +377,16 @@
   cursor: default;
 }
 .cvpick-model-filename {
-  max-width: 140px;
+  flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 11px;
   color: var(--text-secondary, #666);
+}
+.cvpick-yolo-conf {
+  width: 52px;
 }
 .cvpick-btn-row {
   display: flex;

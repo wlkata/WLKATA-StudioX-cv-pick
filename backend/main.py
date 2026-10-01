@@ -811,6 +811,7 @@ class _CVState:
         self.yolo_classes = []
         self.yolo_path = None
         self.yolo_hidden = set()
+        self.yolo_conf = 0.25
         self._last_yolo_dets = []
         self._yolo_infer_lock = threading.Lock()
 
@@ -1329,29 +1330,42 @@ class _CVState:
                 self.yolo_hidden = set()
                 self._last_yolo_dets = []
 
+    def set_yolo_conf(self, conf):
+        try:
+            conf = float(conf)
+        except (TypeError, ValueError):
+            raise ValueError("Threshold must be a number")
+        conf = max(0.05, min(0.95, conf))
+        with self.lock:
+            self.yolo_conf = conf
+        return conf
+
     def yolo_status(self):
         with self.lock:
+            status = {"loaded": False, "conf": self.yolo_conf}
             if self.yolo_model is None:
-                return {"loaded": False}
-            return {
+                return status
+            status.update({
                 "loaded": True,
                 "path": self.yolo_path,
                 "filename": os.path.basename(self.yolo_path or ""),
                 "classes": len(self.yolo_classes),
-            }
+            })
+            return status
 
     def _run_yolo(self, roi_bgr, ox, oy):
         with self.lock:
             model = self.yolo_model
             classes = list(self.yolo_classes)
             hidden = set(self.yolo_hidden)
+            conf = self.yolo_conf
         if model is None or roi_bgr is None or getattr(roi_bgr, "size", 0) == 0:
             return []
         class_by_id = {c["class_id"]: c for c in classes}
         try:
             with self._yolo_infer_lock:
                 results = model.predict(
-                    roi_bgr, verbose=False, imgsz=640, conf=0.25)
+                    roi_bgr, verbose=False, imgsz=640, conf=conf)
         except Exception:
             return []
         if not results:
@@ -1786,6 +1800,18 @@ def load_model():
 def unload_model():
     _state.unload_yolo()
     return jsonify({"success": True})
+
+
+@blueprint.route("/yolo-conf", methods=["GET", "POST"])
+def yolo_conf():
+    if request.method == "GET":
+        return jsonify({"success": True, "conf": _state.yolo_status()["conf"]})
+    data = request.get_json(silent=True) or {}
+    try:
+        conf = _state.set_yolo_conf(data.get("conf"))
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)})
+    return jsonify({"success": True, "conf": conf})
 
 
 @blueprint.route("/learn", methods=["POST"])

@@ -12,6 +12,7 @@
   var modelFilename  = document.getElementById('cvpick-model-filename');
   var loadBtn     = document.getElementById('cvpick-load-btn');
   var unloadBtn   = document.getElementById('cvpick-unload-btn');
+  var yoloConfInput = document.getElementById('cvpick-yolo-conf');
   var yoloSettings = document.getElementById('cvpick-yolo-settings');
   var learnedList = document.getElementById('cvpick-learned-list');
   var colorBtn    = document.getElementById('cvpick-mode-color');
@@ -52,8 +53,11 @@
   var currentPhase = 'learning';
   var LIFT_MIN = 1;
   var LIFT_MAX = 100;
+  var CONF_MIN = 0.05;
+  var CONF_MAX = 0.95;
   var liftHeight = 10;
   var scanEach = false;
+  var yoloConf = 0.25;
   var pickRunning = false;
 
   function clampLift(v) {
@@ -66,7 +70,8 @@
   function savePickSettings() {
     ExtensionAPI.setData('cv-pick', 'pickSettings', {
       liftHeight: liftHeight,
-      scanEach: scanEach
+      scanEach: scanEach,
+      yoloConf: yoloConf
     });
   }
 
@@ -94,10 +99,23 @@
         if (lh != null) liftHeight = lh;
       }
       if (s.scanEach) scanEach = true;
+      if (s.yoloConf != null) {
+        var yc = parseFloat(s.yoloConf);
+        if (isFinite(yc)) {
+          if (yc < CONF_MIN) yc = CONF_MIN;
+          if (yc > CONF_MAX) yc = CONF_MAX;
+          yoloConf = yc;
+        }
+      }
     }
     if (liftInput) liftInput.value = String(liftHeight);
+    if (yoloConfInput) yoloConfInput.value = String(yoloConf);
     if (scanOnceBtn) scanOnceBtn.classList.toggle('active', !scanEach);
     if (scanEachBtn) scanEachBtn.classList.toggle('active', scanEach);
+    ExtensionAPI.fetch('cv-pick', '/yolo-conf', {
+      method: 'POST',
+      body: JSON.stringify({ conf: yoloConf })
+    }).catch(function () {});
   })();
 
   if (liftInput) {
@@ -123,6 +141,39 @@
   }
   if (scanEachBtn) {
     scanEachBtn.addEventListener('click', function () { setScanEach(true); });
+  }
+
+  function applyYoloConf(raw, writeInput) {
+    if (!isFinite(raw)) return false;
+    if (raw < CONF_MIN) raw = CONF_MIN;
+    if (raw > CONF_MAX) raw = CONF_MAX;
+    yoloConf = raw;
+    if (writeInput && yoloConfInput) yoloConfInput.value = String(raw);
+    savePickSettings();
+    ExtensionAPI.fetch('cv-pick', '/yolo-conf', {
+      method: 'POST',
+      body: JSON.stringify({ conf: yoloConf })
+    }).catch(function () {});
+    return true;
+  }
+
+  if (yoloConfInput) {
+    yoloConfInput.addEventListener('input', function () {
+      var raw = parseFloat(this.value);
+      if (!isFinite(raw)) return;
+      if (raw > CONF_MAX) {
+        this.value = String(CONF_MAX);
+        applyYoloConf(CONF_MAX, false);
+      } else if (raw >= CONF_MIN) {
+        applyYoloConf(raw, false);
+      }
+    });
+    yoloConfInput.addEventListener('change', function () {
+      var raw = parseFloat(this.value);
+      if (!applyYoloConf(raw, true)) {
+        this.value = String(yoloConf);
+      }
+    });
   }
 
   // ---- robot jog controls -----------------------------------------------
@@ -1084,7 +1135,11 @@
   var selectedModelFile = null;
 
   function setModelFilename(text) {
-    if (modelFilename) modelFilename.textContent = text || 'No file selected';
+    var label = text || 'No file';
+    if (modelFilename) {
+      modelFilename.textContent = label;
+      modelFilename.title = label;
+    }
   }
 
   function selectedCkptPath() {
@@ -1499,6 +1554,7 @@
     }
     if (pickSelect) pickSelect.disabled = pickRunning || !isCalibrated;
     if (liftInput) liftInput.disabled = pickRunning;
+    if (yoloConfInput) yoloConfInput.disabled = pickRunning;
     if (scanOnceBtn) scanOnceBtn.disabled = pickRunning;
     if (scanEachBtn) scanEachBtn.disabled = pickRunning;
     updateCalibUI();
