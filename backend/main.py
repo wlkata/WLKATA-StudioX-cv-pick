@@ -1105,10 +1105,8 @@ class _CVState:
                 mode = self.mode
                 phase = self.phase
                 roi = list(self.roi)
-                has_yolo = self.yolo_model is not None
-
             processed = self._process(
-                frame, mode, phase, colors, shapes, roi, has_yolo)
+                frame, mode, phase, colors, shapes, roi)
 
             # Hold the JPEG feed until auto-exposure produces a real picture.
             if (_is_blank_frame(processed)
@@ -1125,7 +1123,7 @@ class _CVState:
 
     # -- per-frame processing ----------------------------------------------
 
-    def _process(self, frame, mode, phase, colors, shapes, roi, has_yolo):
+    def _process(self, frame, mode, phase, colors, shapes, roi):
         display = frame.copy()
         fh, fw = frame.shape[:2]
 
@@ -1136,14 +1134,13 @@ class _CVState:
         ry2 = min(fh, int(roi[3] * fh))
 
         count = 0
-        if has_yolo:
-            if phase != "learning":
-                roi_frame = frame[ry1:ry2, rx1:rx2]
-                dets = self._run_yolo(roi_frame, rx1, ry1) if roi_frame.size else []
-                with self.lock:
-                    self._last_yolo_dets = dets
-                count = _draw_yolo_dets(display, dets)
-            tag = "YOLO26n" if phase != "learning" else "YOLO26n READY"
+        if mode == "yolo":
+            roi_frame = frame[ry1:ry2, rx1:rx2]
+            dets = self._run_yolo(roi_frame, rx1, ry1) if roi_frame.size else []
+            with self.lock:
+                self._last_yolo_dets = dets
+            count = _draw_yolo_dets(display, dets)
+            tag = "YOLO26n" if self.yolo_model is not None else "NO YOLO"
         elif phase == "learning":
             _draw_preview(frame, display, mode, rx1, ry1, rx2, ry2)
             mode_tag = "COLOR" if mode == "color" else "SHAPE"
@@ -1392,10 +1389,11 @@ class _CVState:
 
     def learned_list(self):
         with self.lock:
+            items = []
             if self.yolo_model is not None:
                 hidden = set(self.yolo_hidden)
-                return [dict(c) for c in self.yolo_classes if c["id"] not in hidden]
-            items = []
+                items.extend(
+                    dict(c) for c in self.yolo_classes if c["id"] not in hidden)
             for c in self.learned_colors:
                 items.append({k: v for k, v in c.items()})
             for s in self.learned_shapes:
@@ -1408,7 +1406,7 @@ class _CVState:
 
     def remove_item(self, item_id):
         with self.lock:
-            if self.yolo_model is not None:
+            if str(item_id).startswith("yolo-"):
                 self.yolo_hidden.add(item_id)
                 return
             self.learned_colors = [
@@ -1417,7 +1415,6 @@ class _CVState:
                 s for s in self.learned_shapes if s["id"] != item_id]
 
     def clear_all(self):
-        self.unload_yolo()
         with self.lock:
             self.learned_colors.clear()
             self.learned_shapes.clear()
@@ -1451,11 +1448,10 @@ class _CVState:
             return []
 
         with self.lock:
-            has_yolo = self.yolo_model is not None
-            cached = list(self._last_yolo_dets) if has_yolo else []
+            cached = list(self._last_yolo_dets) if mode == "yolo" else []
 
         results = []
-        if has_yolo:
+        if mode == "yolo":
             results = cached if cached else self._run_yolo(roi_frame, rx1, ry1)
         elif mode == "color" and colors:
             results = self._detect_color_objects(roi_frame, colors, rx1, ry1)
@@ -1749,7 +1745,7 @@ def mode():
         return jsonify({"success": True, "mode": _state.mode})
     data = request.get_json() or {}
     m = data.get("mode")
-    if m in ("color", "shape"):
+    if m in ("color", "shape", "yolo"):
         _state.mode = m
         return jsonify({"success": True, "mode": m})
     return jsonify({"success": False, "error": "Invalid mode"})
@@ -1786,11 +1782,20 @@ def load_model():
     return jsonify({"success": True, **info})
 
 
+@blueprint.route("/unload-model", methods=["POST"])
+def unload_model():
+    _state.unload_yolo()
+    return jsonify({"success": True})
+
+
 @blueprint.route("/learn", methods=["POST"])
 def learn():
     data = request.get_json() or {}
     name = (data.get("name") or "").strip() or None
 
+    if _state.mode == "yolo":
+        return jsonify({"success": False,
+                        "error": "Switch to Color or Shape to learn items"})
     if _state.mode == "color":
         item = _state.learn_color(name)
     else:

@@ -104,6 +104,10 @@
   background: var(--accent, #2196F3);
   color: #fff;
 }
+.cvpick-mode-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
 
 /* phase toggle (Learn / Detect) */
 .cvpick-phase-toggle {
@@ -321,6 +325,14 @@
   flex-shrink: 0;
   min-width: 0;
   max-width: 100%;
+}
+.cvpick-yolo-settings {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-primary, #eee);
+}
+.cvpick-yolo-settings .cvpick-btn-row {
+  margin-top: 8px;
 }
 .cvpick-model-row {
   display: flex;

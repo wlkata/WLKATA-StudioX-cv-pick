@@ -4,16 +4,21 @@
   var feedWrap    = document.getElementById('cvpick-feed-wrap');
   var roiOverlay  = document.getElementById('cvpick-roi-overlay');
   var roiRect     = document.getElementById('cvpick-roi-rect');
+  var nameInput   = document.getElementById('cvpick-name');
+  var learnBtn    = document.getElementById('cvpick-learn-btn');
+  var clearBtn    = document.getElementById('cvpick-clear-btn');
   var modelFileInput = document.getElementById('cvpick-model-file');
   var modelBrowseBtn = document.getElementById('cvpick-model-browse');
   var modelFilename  = document.getElementById('cvpick-model-filename');
   var loadBtn     = document.getElementById('cvpick-load-btn');
-  var clearBtn    = document.getElementById('cvpick-clear-btn');
+  var unloadBtn   = document.getElementById('cvpick-unload-btn');
+  var yoloSettings = document.getElementById('cvpick-yolo-settings');
   var learnedList = document.getElementById('cvpick-learned-list');
   var colorBtn    = document.getElementById('cvpick-mode-color');
   var shapeBtn    = document.getElementById('cvpick-mode-shape');
   var learnPhBtn  = document.getElementById('cvpick-phase-learn');
   var detectPhBtn = document.getElementById('cvpick-phase-detect');
+  var modelPhBtn  = document.getElementById('cvpick-phase-model');
   var learnControls = document.getElementById('cvpick-learn-controls');
   var cameraSelect  = document.getElementById('cvpick-camera-select');
   var cameraStartBtn = document.getElementById('cvpick-camera-start');
@@ -986,14 +991,29 @@
 
   // ---- mode toggle ------------------------------------------------------
 
-  function setMode(mode) {
-    currentMode = mode;
-    colorBtn.classList.toggle('active', mode === 'color');
-    shapeBtn.classList.toggle('active', mode === 'shape');
+  function listMode() {
+    return currentPhase === 'yolo' ? 'yolo' : currentMode;
+  }
+
+  function syncBackendMode() {
+    var mode = listMode();
+    var phase = currentPhase === 'yolo' ? 'inference' : currentPhase;
     ExtensionAPI.fetch('cv-pick', '/mode', {
       method: 'POST',
       body: JSON.stringify({ mode: mode })
     });
+    ExtensionAPI.fetch('cv-pick', '/phase', {
+      method: 'POST',
+      body: JSON.stringify({ phase: phase })
+    });
+  }
+
+  function setMode(mode) {
+    if (currentPhase === 'yolo') return;
+    currentMode = mode;
+    colorBtn.classList.toggle('active', mode === 'color');
+    shapeBtn.classList.toggle('active', mode === 'shape');
+    syncBackendMode();
     refreshLearned();
     refreshPickTargets();
   }
@@ -1001,28 +1021,63 @@
   colorBtn.addEventListener('click', function () { setMode('color'); });
   shapeBtn.addEventListener('click', function () { setMode('shape'); });
 
-  // ---- phase toggle (learning / inference) ------------------------------
+  // ---- phase toggle (Learn / Detect / Model) ----------------------------
 
   function setPhase(phase) {
     currentPhase = phase;
     learnPhBtn.classList.toggle('active', phase === 'learning');
     detectPhBtn.classList.toggle('active', phase === 'inference');
-    learnControls.style.display = phase === 'learning' ? '' : 'none';
-    ExtensionAPI.fetch('cv-pick', '/phase', {
-      method: 'POST',
-      body: JSON.stringify({ phase: phase })
-    });
+    if (modelPhBtn) modelPhBtn.classList.toggle('active', phase === 'yolo');
+    colorBtn.disabled = phase === 'yolo';
+    shapeBtn.disabled = phase === 'yolo';
+    if (yoloSettings) yoloSettings.hidden = phase !== 'yolo';
+    if (learnControls) {
+      learnControls.style.display = phase === 'learning' ? '' : 'none';
+    }
+    syncBackendMode();
     if (phase === 'learning') {
       calibState.pixelA = null;
       calibState.pixelB = null;
       calibState.pixelC = null;
       updateCalibUI();
+    } else {
+      updateCalibDetectBtn();
     }
-    updateCalibDetectBtn();
+    refreshLearned();
+    refreshPickTargets();
   }
 
   learnPhBtn.addEventListener('click', function () { setPhase('learning'); });
   detectPhBtn.addEventListener('click', function () { setPhase('inference'); });
+  if (modelPhBtn) {
+    modelPhBtn.addEventListener('click', function () { setPhase('yolo'); });
+  }
+
+  // ---- learn ------------------------------------------------------------
+
+  learnBtn.addEventListener('click', function () {
+    var name = nameInput.value.trim();
+    learnBtn.disabled = true;
+    learnBtn.textContent = 'Learning\u2026';
+
+    ExtensionAPI.fetch('cv-pick', '/learn', {
+      method: 'POST',
+      body: JSON.stringify({ name: name || undefined })
+    }).then(function (data) {
+      learnBtn.disabled = false;
+      learnBtn.textContent = 'Learn';
+      if (data.success) {
+        nameInput.value = '';
+        refreshLearned();
+        ExtensionAPI.showNotification('Learned: ' + data.item.name, 'info');
+      } else {
+        ExtensionAPI.showNotification(data.error || 'Learning failed', 'error');
+      }
+    }).catch(function () {
+      learnBtn.disabled = false;
+      learnBtn.textContent = 'Learn';
+    });
+  });
 
   // ---- load YOLO26n checkpoint ------------------------------------------
 
@@ -1108,26 +1163,48 @@
     ExtensionAPI.fetch('cv-pick', '/clear', { method: 'POST' }).then(function () {
       refreshLearned();
       refreshPickTargets();
-      if (!selectedModelFile) setModelFilename('');
-      ExtensionAPI.showNotification('YOLO model unloaded', 'info');
     });
   });
+
+  if (unloadBtn) {
+    unloadBtn.addEventListener('click', function () {
+      ExtensionAPI.fetch('cv-pick', '/unload-model', { method: 'POST' }).then(function (data) {
+        if (!data.success) {
+          ExtensionAPI.showNotification(data.error || 'Unload failed', 'error');
+          return;
+        }
+        if (!selectedModelFile) setModelFilename('');
+        refreshLearned();
+        refreshPickTargets();
+        ExtensionAPI.showNotification('YOLO model unloaded', 'info');
+      });
+    });
+  }
 
   // ---- learned-items list -----------------------------------------------
 
   function refreshLearned() {
     var titleEl = document.getElementById('cvpick-learned-title');
-    if (titleEl) titleEl.textContent = 'Classes';
+    var emptyMsg;
+    if (listMode() === 'yolo') {
+      if (titleEl) titleEl.textContent = 'YOLO Classes';
+      emptyMsg = 'Load a YOLO26n checkpoint in Settings to detect objects.';
+    } else if (currentMode === 'shape') {
+      if (titleEl) titleEl.textContent = 'Learned Shapes';
+      emptyMsg = 'No shapes learned yet. Place an object in the zone and click Learn.';
+    } else {
+      if (titleEl) titleEl.textContent = 'Learned Colors';
+      emptyMsg = 'No colors learned yet. Place an object in the zone and click Learn.';
+    }
 
     ExtensionAPI.fetch('cv-pick', '/learned').then(function (data) {
       var items = (data.success && data.items) ? data.items : [];
       var filtered = items.filter(function (item) {
-        return item.mode === 'yolo' || item.mode === currentMode;
+        return item.mode === listMode();
       });
 
       if (filtered.length === 0) {
-        learnedList.innerHTML =
-          '<p class="cvpick-empty">Load a YOLO26n checkpoint to detect objects.</p>';
+        learnedList.innerHTML = '<p class="cvpick-empty">' + emptyMsg + '</p>';
         return;
       }
 
@@ -1225,11 +1302,11 @@
   }
 
   function updateCalibDetectBtn() {
-    var inDetect = currentPhase === 'inference';
+    var inDetect = currentPhase === 'inference' || currentPhase === 'yolo';
     calibDetectBtn.disabled = !inDetect || pickRunning;
     calibDetectBtn.title = inDetect
       ? 'Detect 3 objects in the zone as calibration markers'
-      : 'Switch to Detect mode to detect markers';
+      : 'Switch to Detect or Model to detect markers';
   }
 
   function saveCalibPoses() {
@@ -1259,8 +1336,8 @@
 
   // Detect markers — pick 3 largest detections (Detect mode only)
   calibDetectBtn.addEventListener('click', function () {
-    if (currentPhase !== 'inference') {
-      ExtensionAPI.showNotification('Switch to Detect mode to detect markers', 'error');
+    if (currentPhase !== 'inference' && currentPhase !== 'yolo') {
+      ExtensionAPI.showNotification('Switch to Detect or Model to detect markers', 'error');
       return;
     }
     calibDetectBtn.disabled = true;
@@ -1268,7 +1345,7 @@
     ExtensionAPI.fetch('cv-pick', '/detections').then(function (data) {
       calibDetectBtn.textContent = 'Detect Markers';
       updateCalibDetectBtn();
-      if (currentPhase !== 'inference') return;
+      if (currentPhase !== 'inference' && currentPhase !== 'yolo') return;
       if (!data.success || !data.detections || data.detections.length < 3) {
         ExtensionAPI.showNotification(
           'Need at least 3 detected objects. Learn an item, switch to Detect, and place 3 markers in an L-shape.',
@@ -1434,7 +1511,7 @@
 
       var names = [];
       learned.forEach(function (item) {
-        if (item.mode !== 'yolo' && item.mode !== currentMode) return;
+        if (item.mode !== listMode()) return;
         if (item.name && names.indexOf(item.name) === -1) names.push(item.name);
       });
 
