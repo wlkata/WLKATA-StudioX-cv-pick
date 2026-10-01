@@ -1246,6 +1246,7 @@
     pixelA: null, pixelB: null, pixelC: null,   // [px, py]
     robotA: null, robotB: null, robotC: null,   // {x, y, z}
   };
+  var isCalibrated = false;
 
   function fmtPx(pt) {
     return '(' + pt[0] + ', ' + pt[1] + ') px';
@@ -1328,8 +1329,10 @@
     }
     ExtensionAPI.fetch('cv-pick', '/calibration').then(function (data) {
       if (data.success && data.calibration) {
+        isCalibrated = true;
         calibStatus.textContent = 'Calibrated';
         calibStatus.classList.add('calibrated');
+        updatePickUI();
       }
     }).catch(function () {});
   }
@@ -1456,6 +1459,7 @@
       })
     }).then(function (data) {
       if (data.success) {
+        isCalibrated = true;
         calibStatus.textContent = 'Calibrated';
         calibStatus.classList.add('calibrated');
         calibState.pixelA = null;
@@ -1463,6 +1467,7 @@
         calibState.pixelC = null;
         saveCalibPoses();
         updateCalibUI();
+        updatePickUI();
         ExtensionAPI.showNotification('Calibration saved! Z=' + avgZ.toFixed(1), 'info');
       } else {
         ExtensionAPI.showNotification(data.error || 'Calibration failed', 'error');
@@ -1487,11 +1492,12 @@
 
   function updatePickUI() {
     dropPosEl.textContent = dropPosition ? fmtRobot(dropPosition) : '\u2014';
-    pickAllBtn.disabled = !dropPosition || pickRunning;
+    var canPick = !!dropPosition && isCalibrated && !pickRunning;
+    pickAllBtn.disabled = !canPick;
     if (pickOneBtn) {
-      pickOneBtn.disabled = !dropPosition || pickRunning || !pickSelect.value;
+      pickOneBtn.disabled = !canPick || !pickSelect.value;
     }
-    if (pickSelect) pickSelect.disabled = pickRunning;
+    if (pickSelect) pickSelect.disabled = pickRunning || !isCalibrated;
     if (liftInput) liftInput.disabled = pickRunning;
     if (scanOnceBtn) scanOnceBtn.disabled = pickRunning;
     if (scanEachBtn) scanEachBtn.disabled = pickRunning;
@@ -1520,6 +1526,13 @@
         var n = d.name;
         if (!n) return;
         counts[n] = (counts[n] || 0) + 1;
+      });
+
+      names.sort(function (a, b) {
+        var ca = counts[a] || 0;
+        var cb = counts[b] || 0;
+        if (cb !== ca) return cb - ca;
+        return a < b ? -1 : a > b ? 1 : 0;
       });
 
       pickSelect.innerHTML = '<option value="">-- select group --</option>';
