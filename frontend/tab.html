@@ -41,28 +41,26 @@
       </div>
     </div>
     <div class="cvpick-settings">
-      <h3 class="cvpick-section-title">Settings</h3>
-      <div class="cvpick-settings-row">
-        <label class="cvpick-settings-label" for="cvpick-lift-height">Lift height</label>
-        <input id="cvpick-lift-height" class="cvpick-lift-input" type="number" min="1" max="100" step="1" value="10" title="Height above the object and drop while moving" />
-      </div>
-      <div class="cvpick-settings-row">
-        <span class="cvpick-settings-label">Scan</span>
-        <div class="cvpick-scan-switch" role="group" aria-label="Scan mode">
-          <button type="button" id="cvpick-scan-once" class="cvpick-scan-btn active" title="Detect all objects once, then pick that list">Once</button>
-          <button type="button" id="cvpick-scan-each" class="cvpick-scan-btn" title="Detect, pick one object, then detect again">Each pick</button>
+      <div class="cvpick-settings-main">
+        <h3 class="cvpick-section-title">Settings</h3>
+        <div class="cvpick-settings-row">
+          <label class="cvpick-settings-label" for="cvpick-lift-height">Lift height</label>
+          <input id="cvpick-lift-height" class="cvpick-lift-input" type="number" min="1" max="100" step="1" value="10" title="Height above the object and drop while moving" />
+        </div>
+        <div class="cvpick-settings-row">
+          <span class="cvpick-settings-label">Scan</span>
+          <div class="cvpick-scan-switch" role="group" aria-label="Scan mode">
+            <button type="button" id="cvpick-scan-once" class="cvpick-scan-btn active" title="Detect all objects once, then pick that list">Once</button>
+            <button type="button" id="cvpick-scan-each" class="cvpick-scan-btn" title="Detect, pick one object, then detect again">Each pick</button>
+          </div>
         </div>
       </div>
       <div id="cvpick-yolo-settings" class="cvpick-yolo-settings" hidden>
-        <div class="cvpick-model-row">
-          <input id="cvpick-model-file" type="file" accept=".pt,.ckpt" hidden />
-          <button type="button" id="cvpick-model-browse" class="cvpick-btn-secondary">Choose file</button>
-          <span id="cvpick-model-filename" class="cvpick-model-filename">No file selected</span>
-        </div>
-        <div class="cvpick-btn-row">
-          <button id="cvpick-load-btn" class="cvpick-btn-primary" disabled>Load</button>
-          <button id="cvpick-unload-btn" class="cvpick-btn-secondary">Unload</button>
-        </div>
+        <input id="cvpick-model-file" type="file" accept=".pt,.ckpt" hidden />
+        <button type="button" id="cvpick-model-browse" class="cvpick-model-btn">Choose</button>
+        <span id="cvpick-model-filename" class="cvpick-model-filename">No file</span>
+        <button type="button" id="cvpick-load-btn" class="cvpick-model-btn cvpick-model-btn-primary" disabled>Load</button>
+        <button type="button" id="cvpick-unload-btn" class="cvpick-model-btn">Unload</button>
       </div>
     </div>
   </div>

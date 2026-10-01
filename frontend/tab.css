@@ -143,12 +143,18 @@
 
 /* ---- settings panel ---- */
 .cvpick-settings {
+  display: flex;
+  align-items: center;
+  gap: 16px;
   margin-top: 10px;
   padding: 10px 12px 12px;
   border: 1px solid var(--border-primary, #ccc);
   border-radius: 8px;
   background: var(--bg-primary, #fff);
   flex-shrink: 0;
+}
+.cvpick-settings-main {
+  flex: 0 0 auto;
 }
 .cvpick-settings .cvpick-section-title {
   margin-bottom: 6px;
@@ -326,22 +332,35 @@
   min-width: 0;
   max-width: 100%;
 }
-.cvpick-yolo-settings {
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border-primary, #eee);
-}
-.cvpick-yolo-settings .cvpick-btn-row {
-  margin-top: 8px;
-}
-.cvpick-model-row {
+.cvpick-yolo-settings:not([hidden]) {
   display: flex;
   align-items: center;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 6px;
   min-width: 0;
+  flex: 1;
+}
+.cvpick-model-btn {
+  padding: 3px 8px;
+  border: none;
+  border-radius: 4px;
+  background: var(--bg-secondary, #f5f5f5);
+  color: var(--text-primary, #333);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.cvpick-model-btn-primary {
+  background: var(--accent, #2196F3);
+  color: #fff;
+}
+.cvpick-model-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 .cvpick-model-filename {
-  flex: 1;
+  max-width: 140px;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
