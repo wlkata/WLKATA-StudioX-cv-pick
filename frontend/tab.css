@@ -322,6 +322,21 @@
   min-width: 0;
   max-width: 100%;
 }
+.cvpick-model-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.cvpick-model-filename {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text-secondary, #666);
+}
 .cvpick-btn-row {
   display: flex;
   gap: 8px;

@@ -4,8 +4,10 @@
   var feedWrap    = document.getElementById('cvpick-feed-wrap');
   var roiOverlay  = document.getElementById('cvpick-roi-overlay');
   var roiRect     = document.getElementById('cvpick-roi-rect');
-  var nameInput   = document.getElementById('cvpick-name');
-  var learnBtn    = document.getElementById('cvpick-learn-btn');
+  var modelFileInput = document.getElementById('cvpick-model-file');
+  var modelBrowseBtn = document.getElementById('cvpick-model-browse');
+  var modelFilename  = document.getElementById('cvpick-model-filename');
+  var loadBtn     = document.getElementById('cvpick-load-btn');
   var clearBtn    = document.getElementById('cvpick-clear-btn');
   var learnedList = document.getElementById('cvpick-learned-list');
   var colorBtn    = document.getElementById('cvpick-mode-color');
@@ -1022,58 +1024,110 @@
   learnPhBtn.addEventListener('click', function () { setPhase('learning'); });
   detectPhBtn.addEventListener('click', function () { setPhase('inference'); });
 
-  // ---- learn ------------------------------------------------------------
+  // ---- load YOLO26n checkpoint ------------------------------------------
 
-  learnBtn.addEventListener('click', function () {
-    var name = nameInput.value.trim();
-    learnBtn.disabled = true;
-    learnBtn.textContent = 'Learning\u2026';
+  var selectedModelFile = null;
 
-    ExtensionAPI.fetch('cv-pick', '/learn', {
-      method: 'POST',
-      body: JSON.stringify({ name: name || undefined })
-    }).then(function (data) {
-      learnBtn.disabled = false;
-      learnBtn.textContent = 'Learn';
+  function setModelFilename(text) {
+    if (modelFilename) modelFilename.textContent = text || 'No file selected';
+  }
+
+  function selectedCkptPath() {
+    if (!selectedModelFile) return '';
+    return selectedModelFile.path || '';
+  }
+
+  if (modelBrowseBtn && modelFileInput) {
+    modelBrowseBtn.addEventListener('click', function () {
+      modelFileInput.click();
+    });
+    modelFileInput.addEventListener('change', function () {
+      selectedModelFile = this.files && this.files[0] ? this.files[0] : null;
+      setModelFilename(selectedModelFile ? selectedModelFile.name : '');
+      if (loadBtn) loadBtn.disabled = !selectedModelFile;
+    });
+  }
+
+  function loadModel() {
+    if (!selectedModelFile) {
+      ExtensionAPI.showNotification('Choose a YOLO26n .pt checkpoint', 'error');
+      return;
+    }
+    loadBtn.disabled = true;
+    loadBtn.textContent = 'Loading\u2026';
+
+    var path = selectedCkptPath();
+    var req;
+    if (path) {
+      req = ExtensionAPI.fetch('cv-pick', '/load-model', {
+        method: 'POST',
+        body: JSON.stringify({ path: path })
+      });
+    } else {
+      var form = new FormData();
+      form.append('file', selectedModelFile);
+      req = fetch(ExtensionAPI.getServerUrl() + '/ext/cv-pick/load-model', {
+        method: 'POST',
+        body: form
+      }).then(function (resp) { return resp.json(); });
+    }
+
+    req.then(function (data) {
+      loadBtn.textContent = 'Load';
+      loadBtn.disabled = !selectedModelFile;
       if (data.success) {
-        nameInput.value = '';
+        setModelFilename(data.filename || selectedModelFile.name);
         refreshLearned();
-        ExtensionAPI.showNotification('Learned: ' + data.item.name, 'info');
+        refreshPickTargets();
+        ExtensionAPI.showNotification(
+          'Loaded YOLO26n (' + (data.classes || 0) + ' classes)',
+          'info');
       } else {
-        ExtensionAPI.showNotification(data.error || 'Learning failed', 'error');
+        ExtensionAPI.showNotification(data.error || 'Failed to load checkpoint', 'error');
       }
     }).catch(function () {
-      learnBtn.disabled = false;
-      learnBtn.textContent = 'Learn';
+      loadBtn.textContent = 'Load';
+      loadBtn.disabled = !selectedModelFile;
+      ExtensionAPI.showNotification('Failed to load checkpoint', 'error');
     });
-  });
+  }
+
+  if (loadBtn) loadBtn.addEventListener('click', loadModel);
+
+  function refreshModelStatus() {
+    ExtensionAPI.fetch('cv-pick', '/model').then(function (data) {
+      if (data.success && data.loaded) {
+        setModelFilename(data.filename || 'YOLO26n loaded');
+      }
+    }).catch(function () {});
+  }
 
   // ---- clear all --------------------------------------------------------
 
   clearBtn.addEventListener('click', function () {
-    ExtensionAPI.fetch('cv-pick', '/clear', { method: 'POST' })
-      .then(refreshLearned);
+    ExtensionAPI.fetch('cv-pick', '/clear', { method: 'POST' }).then(function () {
+      refreshLearned();
+      refreshPickTargets();
+      if (!selectedModelFile) setModelFilename('');
+      ExtensionAPI.showNotification('YOLO model unloaded', 'info');
+    });
   });
 
   // ---- learned-items list -----------------------------------------------
 
   function refreshLearned() {
-    var kind = currentMode === 'shape' ? 'shapes' : 'colors';
     var titleEl = document.getElementById('cvpick-learned-title');
-    if (titleEl) {
-      titleEl.textContent = currentMode === 'shape' ? 'Learned Shapes' : 'Learned Colors';
-    }
+    if (titleEl) titleEl.textContent = 'Classes';
 
     ExtensionAPI.fetch('cv-pick', '/learned').then(function (data) {
       var items = (data.success && data.items) ? data.items : [];
       var filtered = items.filter(function (item) {
-        return item.mode === currentMode;
+        return item.mode === 'yolo' || item.mode === currentMode;
       });
 
       if (filtered.length === 0) {
         learnedList.innerHTML =
-          '<p class="cvpick-empty">No ' + kind + ' learned yet. '
-          + 'Place an object in the zone and click Learn.</p>';
+          '<p class="cvpick-empty">Load a YOLO26n checkpoint to detect objects.</p>';
         return;
       }
 
@@ -1380,7 +1434,7 @@
 
       var names = [];
       learned.forEach(function (item) {
-        if (item.mode !== currentMode) return;
+        if (item.mode !== 'yolo' && item.mode !== currentMode) return;
         if (item.name && names.indexOf(item.name) === -1) names.push(item.name);
       });
 
@@ -1685,4 +1739,5 @@
 
   updatePickUI();
   refreshPickTargets();
+  refreshModelStatus();
 })();

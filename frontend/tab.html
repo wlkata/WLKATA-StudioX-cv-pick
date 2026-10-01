@@ -29,12 +29,12 @@
         <select id="cvpick-resolution-select" class="cvpick-select" title="Resolution"></select>
       </div>
       <div class="cvpick-toolbar-row">
-        <div class="cvpick-mode-toggle">
+        <div class="cvpick-mode-toggle" hidden>
           <button id="cvpick-mode-color" class="cvpick-mode-btn active">Color</button>
           <button id="cvpick-mode-shape" class="cvpick-mode-btn">Shape</button>
         </div>
         <div class="cvpick-phase-toggle">
-          <button id="cvpick-phase-learn" class="cvpick-phase-btn active">Learn</button>
+          <button id="cvpick-phase-learn" class="cvpick-phase-btn active">Model</button>
           <button id="cvpick-phase-detect" class="cvpick-phase-btn">Detect</button>
         </div>
       </div>
@@ -99,16 +99,20 @@
     </div>
 
     <div id="cvpick-learn-controls" class="cvpick-controls">
-      <input id="cvpick-name" type="text" placeholder="Name (optional)" />
+      <div class="cvpick-model-row">
+        <input id="cvpick-model-file" type="file" accept=".pt,.ckpt" hidden />
+        <button type="button" id="cvpick-model-browse" class="cvpick-btn-secondary">Choose file</button>
+        <span id="cvpick-model-filename" class="cvpick-model-filename">No file selected</span>
+      </div>
       <div class="cvpick-btn-row">
-        <button id="cvpick-learn-btn" class="cvpick-btn-primary">Learn</button>
-        <button id="cvpick-clear-btn" class="cvpick-btn-secondary">Clear All</button>
+        <button id="cvpick-load-btn" class="cvpick-btn-primary" disabled>Load</button>
+        <button id="cvpick-clear-btn" class="cvpick-btn-secondary">Unload</button>
       </div>
     </div>
     <div class="cvpick-section">
-      <h3 id="cvpick-learned-title" class="cvpick-section-title">Learned Colors</h3>
+      <h3 id="cvpick-learned-title" class="cvpick-section-title">Classes</h3>
       <div id="cvpick-learned-list">
-        <p class="cvpick-empty">No colors learned yet. Place an object in the zone and click Learn.</p>
+        <p class="cvpick-empty">Load a YOLO26n checkpoint to detect objects.</p>
       </div>
     </div>
 

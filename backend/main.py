@@ -1,9 +1,9 @@
 """
 CV Pick extension backend.
 
-Real-time color and shape detection with a learning workflow.
-A background thread captures webcam frames, runs detection for every learned
-item, draws bounding-box overlays, and exposes the result as an MJPEG stream.
+Load a local YOLO26n checkpoint and run real-time detection in the ROI.
+A background thread captures webcam frames, overlays boxes, and exposes
+the result as JPEG frames.
 """
 
 import base64
@@ -43,6 +43,64 @@ _PALETTE = [
     (0, 188, 212),    # cyan
     (255, 87, 34),    # deep-orange
 ]
+
+_YOLO26N_MARKERS = ("yolo26n", "yolov26n")
+_YOLO26_OTHER = (
+    "yolo26s", "yolo26m", "yolo26l", "yolo26x",
+    "yolov26s", "yolov26m", "yolov26l", "yolov26x",
+)
+_CKPT_EXTS = (".pt", ".ckpt")
+
+
+def _warmup_yolo_import():
+    """Import torch/ultralytics in the background so Load is not the first hit."""
+    try:
+        import torch  # noqa: F401
+        import ultralytics  # noqa: F401
+    except Exception:
+        pass
+
+
+threading.Thread(target=_warmup_yolo_import, daemon=True).start()
+
+
+def _ckpt_hints(path, model=None):
+    hints = [os.path.basename(path or "").lower()]
+    ckpt = getattr(model, "ckpt", None) if model is not None else None
+    if model is not None:
+        ov = getattr(model, "overrides", None) or {}
+        if ov.get("model"):
+            hints.append(str(ov["model"]).lower())
+        yaml = getattr(getattr(model, "model", None), "yaml", None) or {}
+        if isinstance(yaml, dict):
+            for key in ("yaml_file", "scale"):
+                if yaml.get(key) is not None:
+                    hints.append(str(yaml[key]).lower())
+    if isinstance(ckpt, dict):
+        args = ckpt.get("train_args") or {}
+        for key in ("model", "name"):
+            if args.get(key):
+                hints.append(str(args[key]).lower())
+    return " ".join(hints)
+
+
+def _is_yolo26n(path, model=None):
+    blob = _ckpt_hints(path, model)
+    if any(tag in blob for tag in _YOLO26_OTHER):
+        return False
+    if any(tag in blob for tag in _YOLO26N_MARKERS):
+        return True
+    yaml = getattr(getattr(model, "model", None), "yaml", None) or {}
+    if not isinstance(yaml, dict):
+        return False
+    scale = str(yaml.get("scale") or "").lower()
+    yaml_file = str(yaml.get("yaml_file") or "").lower()
+    return scale == "n" and ("yolo26" in yaml_file or "yolov26" in yaml_file)
+
+
+def _allowed_ckpt_filename(name):
+    lower = (name or "").lower()
+    return any(lower.endswith(ext) for ext in _CKPT_EXTS)
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +684,18 @@ def _draw_kept(display, kept, offset=(0, 0)):
         _put_label(display, item["name"], bx, by, bgr)
 
 
+def _draw_yolo_dets(display, dets):
+    for d in dets:
+        x, y, w, h = d["bbox"]
+        bgr = tuple(int(c) for c in d["display_color"])
+        cv2.rectangle(display, (x, y), (x + w, y + h), bgr, 2)
+        label = d["name"]
+        if d.get("conf") is not None:
+            label = "{} {:.2f}".format(label, d["conf"])
+        _put_label(display, label, x, y, bgr)
+    return len(dets)
+
+
 def _detect_colors(frame, display, colors, offset=(0, 0)):
     """Detect learned colours with winner-takes-all NMS.
 
@@ -737,6 +807,12 @@ class _CVState:
         self._camera_name = ""
         self._lifecycle = threading.Lock()
         self._started_at = 0.0
+        self.yolo_model = None
+        self.yolo_classes = []
+        self.yolo_path = None
+        self.yolo_hidden = set()
+        self._last_yolo_dets = []
+        self._yolo_infer_lock = threading.Lock()
 
     # -- camera lifecycle --------------------------------------------------
 
@@ -1029,8 +1105,10 @@ class _CVState:
                 mode = self.mode
                 phase = self.phase
                 roi = list(self.roi)
+                has_yolo = self.yolo_model is not None
 
-            processed = self._process(frame, mode, phase, colors, shapes, roi)
+            processed = self._process(
+                frame, mode, phase, colors, shapes, roi, has_yolo)
 
             # Hold the JPEG feed until auto-exposure produces a real picture.
             if (_is_blank_frame(processed)
@@ -1047,8 +1125,7 @@ class _CVState:
 
     # -- per-frame processing ----------------------------------------------
 
-    @staticmethod
-    def _process(frame, mode, phase, colors, shapes, roi):
+    def _process(self, frame, mode, phase, colors, shapes, roi, has_yolo):
         display = frame.copy()
         fh, fw = frame.shape[:2]
 
@@ -1059,8 +1136,18 @@ class _CVState:
         ry2 = min(fh, int(roi[3] * fh))
 
         count = 0
-        if phase == "learning":
+        if has_yolo:
+            if phase != "learning":
+                roi_frame = frame[ry1:ry2, rx1:rx2]
+                dets = self._run_yolo(roi_frame, rx1, ry1) if roi_frame.size else []
+                with self.lock:
+                    self._last_yolo_dets = dets
+                count = _draw_yolo_dets(display, dets)
+            tag = "YOLO26n" if phase != "learning" else "YOLO26n READY"
+        elif phase == "learning":
             _draw_preview(frame, display, mode, rx1, ry1, rx2, ry2)
+            mode_tag = "COLOR" if mode == "color" else "SHAPE"
+            tag = "LEARN " + mode_tag
         else:
             roi_frame = frame[ry1:ry2, rx1:rx2]
             if roi_frame.size > 0:
@@ -1070,10 +1157,9 @@ class _CVState:
                 elif mode == "shape" and shapes:
                     count = _detect_shapes(roi_frame, display, shapes,
                                            offset=(rx1, ry1))
+            mode_tag = "COLOR" if mode == "color" else "SHAPE"
+            tag = mode_tag
 
-        # HUD
-        mode_tag = "COLOR" if mode == "color" else "SHAPE"
-        tag = ("LEARN " + mode_tag) if phase == "learning" else mode_tag
         cv2.putText(display, tag, (10, 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(display, tag, (10, 24),
@@ -1187,8 +1273,128 @@ class _CVState:
 
     # -- queries -----------------------------------------------------------
 
+    def load_yolo(self, path):
+        path = os.path.abspath(path)
+        if not os.path.isfile(path):
+            raise ValueError("Checkpoint not found")
+        if not _allowed_ckpt_filename(path):
+            raise ValueError("Need a .pt or .ckpt file")
+        try:
+            from ultralytics import YOLO
+        except ImportError:
+            raise ValueError(
+                "ultralytics is not installed. Add it to this extension env.")
+
+        model = YOLO(path)
+        task = getattr(model, "task", "detect") or "detect"
+        if task != "detect":
+            raise ValueError(
+                "Need a YOLO26n detection checkpoint, not task '{}'".format(task))
+        if not _is_yolo26n(path, model):
+            raise ValueError(
+                "Only YOLO26n checkpoints are supported. "
+                "Load a yolo26n.pt (or a YOLO26n fine-tune).")
+
+        names = getattr(model, "names", None) or {}
+        if isinstance(names, dict):
+            pairs = sorted(names.items(), key=lambda kv: int(kv[0]))
+        else:
+            pairs = list(enumerate(names))
+        classes = []
+        for idx, name in pairs:
+            classes.append({
+                "id": "yolo-{}".format(int(idx)),
+                "name": str(name),
+                "mode": "yolo",
+                "class_id": int(idx),
+                "display_color": list(_PALETTE[int(idx) % len(_PALETTE)]),
+            })
+        with self._yolo_infer_lock:
+            with self.lock:
+                self.yolo_model = model
+                self.yolo_classes = classes
+                self.yolo_path = path
+                self.yolo_hidden = set()
+                self._last_yolo_dets = []
+        return {
+            "path": path,
+            "filename": os.path.basename(path),
+            "classes": len(classes),
+            "items": classes,
+        }
+
+    def unload_yolo(self):
+        with self._yolo_infer_lock:
+            with self.lock:
+                self.yolo_model = None
+                self.yolo_classes = []
+                self.yolo_path = None
+                self.yolo_hidden = set()
+                self._last_yolo_dets = []
+
+    def yolo_status(self):
+        with self.lock:
+            if self.yolo_model is None:
+                return {"loaded": False}
+            return {
+                "loaded": True,
+                "path": self.yolo_path,
+                "filename": os.path.basename(self.yolo_path or ""),
+                "classes": len(self.yolo_classes),
+            }
+
+    def _run_yolo(self, roi_bgr, ox, oy):
+        with self.lock:
+            model = self.yolo_model
+            classes = list(self.yolo_classes)
+            hidden = set(self.yolo_hidden)
+        if model is None or roi_bgr is None or getattr(roi_bgr, "size", 0) == 0:
+            return []
+        class_by_id = {c["class_id"]: c for c in classes}
+        try:
+            with self._yolo_infer_lock:
+                results = model.predict(
+                    roi_bgr, verbose=False, imgsz=640, conf=0.25)
+        except Exception:
+            return []
+        if not results:
+            return []
+        boxes = getattr(results[0], "boxes", None)
+        if boxes is None:
+            return []
+        try:
+            xyxy = boxes.xyxy.cpu().numpy()
+            cls = boxes.cls.cpu().numpy()
+            conf = boxes.conf.cpu().numpy()
+        except Exception:
+            return []
+        dets = []
+        for i in range(len(xyxy)):
+            item = class_by_id.get(int(cls[i]))
+            if item is None or item["id"] in hidden:
+                continue
+            x1, y1, x2, y2 = [float(v) for v in xyxy[i]]
+            x, y = int(x1), int(y1)
+            w, h = max(0, int(x2 - x1)), max(0, int(y2 - y1))
+            if w < 2 or h < 2:
+                continue
+            dets.append({
+                "name": item["name"],
+                "mode": "yolo",
+                "center_px": [int(ox + x + w / 2), int(oy + y + h / 2)],
+                "bbox": [ox + x, oy + y, w, h],
+                "area": w * h,
+                "display_color": item["display_color"],
+                "conf": float(conf[i]),
+            })
+        dets.sort(key=lambda d: d["area"], reverse=True)
+        return dets
+
     def learned_list(self):
         with self.lock:
+            if self.yolo_model is not None:
+                hidden = set(self.yolo_hidden)
+                return [dict(c) for c in self.yolo_classes if c["id"] not in hidden]
             items = []
             for c in self.learned_colors:
                 items.append({k: v for k, v in c.items()})
@@ -1202,12 +1408,16 @@ class _CVState:
 
     def remove_item(self, item_id):
         with self.lock:
+            if self.yolo_model is not None:
+                self.yolo_hidden.add(item_id)
+                return
             self.learned_colors = [
                 c for c in self.learned_colors if c["id"] != item_id]
             self.learned_shapes = [
                 s for s in self.learned_shapes if s["id"] != item_id]
 
     def clear_all(self):
+        self.unload_yolo()
         with self.lock:
             self.learned_colors.clear()
             self.learned_shapes.clear()
@@ -1240,8 +1450,14 @@ class _CVState:
         if roi_frame.size == 0:
             return []
 
+        with self.lock:
+            has_yolo = self.yolo_model is not None
+            cached = list(self._last_yolo_dets) if has_yolo else []
+
         results = []
-        if mode == "color" and colors:
+        if has_yolo:
+            results = cached if cached else self._run_yolo(roi_frame, rx1, ry1)
+        elif mode == "color" and colors:
             results = self._detect_color_objects(roi_frame, colors, rx1, ry1)
         elif mode == "shape" and shapes:
             results = self._detect_shape_objects(roi_frame, shapes, rx1, ry1)
@@ -1537,6 +1753,37 @@ def mode():
         _state.mode = m
         return jsonify({"success": True, "mode": m})
     return jsonify({"success": False, "error": "Invalid mode"})
+
+
+@blueprint.route("/model", methods=["GET"])
+def model_status():
+    return jsonify({"success": True, **_state.yolo_status()})
+
+
+@blueprint.route("/load-model", methods=["POST"])
+def load_model():
+    path = None
+    upload = request.files.get("file")
+    if upload and upload.filename:
+        filename = os.path.basename(upload.filename)
+        if not _allowed_ckpt_filename(filename):
+            return jsonify({"success": False, "error": "Need a .pt or .ckpt file"})
+        dest_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_models")
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = os.path.join(dest_dir, filename)
+        upload.save(dest)
+        path = dest
+    else:
+        data = request.get_json(silent=True) or {}
+        path = (data.get("path") or "").strip() or None
+
+    if not path:
+        return jsonify({"success": False, "error": "Choose a local YOLO26n checkpoint"})
+    try:
+        info = _state.load_yolo(path)
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)})
+    return jsonify({"success": True, **info})
 
 
 @blueprint.route("/learn", methods=["POST"])
