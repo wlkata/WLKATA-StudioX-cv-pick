@@ -7,10 +7,14 @@ the result as JPEG frames.
 """
 
 import base64
+import csv
 import json
 import os
 import platform
+import re
+import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -81,6 +85,16 @@ def _ckpt_hints(path, model=None):
         for key in ("model", "name"):
             if args.get(key):
                 hints.append(str(args[key]).lower())
+    # Fine-tunes are saved as weights/best.pt; Ultralytics writes the
+    # original model name into the sibling args.yaml.
+    try:
+        parent = os.path.dirname(os.path.dirname(os.path.abspath(path or "")))
+        args_yaml = os.path.join(parent, "args.yaml")
+        if os.path.isfile(args_yaml):
+            with open(args_yaml, "r", encoding="utf-8") as f:
+                hints.append(f.read().lower())
+    except Exception:
+        pass
     return " ".join(hints)
 
 
@@ -1600,6 +1614,246 @@ class _CVState:
 
 _state = _CVState()
 
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+_TRAIN_ROOT = os.path.join(_BACKEND_DIR, "_train")
+_TRAIN_RUNNER = os.path.join(_BACKEND_DIR, "train_runner.py")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_SECRET_RE = re.compile(r"ul_[0-9a-f]{16,}", re.I)
+_ENV_SECRET_RE = re.compile(
+    r"(ULTRALYTICS_API_KEY\s*=\s*)(['\"]?)([^'\"\s]+)\2", re.I)
+_LOG_LIMIT = 2500
+
+
+def _redact_secrets(text):
+    text = _ENV_SECRET_RE.sub(r"\1\2***\2", text or "")
+    return _SECRET_RE.sub("ul_***", text)
+
+
+class _TrainJob(object):
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.run_id = None
+        self.run_dir = None
+        self.proc = None
+        self.lines = []
+        self.running = False
+        self.done = False
+        self.error = None
+        self.returncode = None
+        self.source_cwd = None
+
+
+_train_job = _TrainJob()
+
+
+def _train_progress(run_dir):
+    path = os.path.join(run_dir or "", "progress.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _train_save_dir(run_dir, progress=None):
+    progress = progress if progress is not None else _train_progress(run_dir)
+    save_dir = progress.get("save_dir")
+    if save_dir and os.path.isdir(save_dir):
+        return save_dir
+    candidate = os.path.join(run_dir, "runs", "train")
+    if os.path.isdir(candidate):
+        return candidate
+    runs = os.path.join(run_dir, "runs")
+    if not os.path.isdir(runs):
+        return None
+    for root, _dirs, files in os.walk(runs):
+        if "results.csv" in files or os.path.isdir(os.path.join(root, "weights")):
+            return root
+    return None
+
+
+def _train_ckpt(run_dir, progress=None):
+    progress = progress if progress is not None else _train_progress(run_dir)
+    save_dir = _train_save_dir(run_dir, progress)
+    best = progress.get("best") or (os.path.join(save_dir, "weights", "best.pt") if save_dir else "")
+    last = progress.get("last") or (os.path.join(save_dir, "weights", "last.pt") if save_dir else "")
+    best = best if best and os.path.isfile(best) else ""
+    last = last if last and os.path.isfile(last) else ""
+    return best, last, save_dir
+
+
+def _train_results(save_dir):
+    if not save_dir:
+        return {}
+    path = os.path.join(save_dir, "results.csv")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, newline="") as f:
+            rows = list(csv.DictReader(f))
+    except Exception:
+        return {}
+    if not rows:
+        return {}
+
+    def lookup(row, names):
+        stripped = { (k or "").strip(): (v or "").strip() for k, v in row.items() }
+        for name in names:
+            if name in stripped and stripped[name] != "":
+                try:
+                    return float(stripped[name])
+                except ValueError:
+                    return None
+        return None
+
+    last = rows[-1]
+    return {
+        "epoch": lookup(last, ("epoch",)),
+        "box_loss": lookup(last, ("train/box_loss",)),
+        "cls_loss": lookup(last, ("train/cls_loss",)),
+        "precision": lookup(last, ("metrics/precision(B)", "metrics/precision")),
+        "recall": lookup(last, ("metrics/recall(B)", "metrics/recall")),
+        "map50": lookup(last, ("metrics/mAP50(B)", "metrics/mAP50")),
+        "map50_95": lookup(last, ("metrics/mAP50-95(B)", "metrics/mAP50-95")),
+        "epochs": len(rows),
+    }
+
+
+def _looks_like_train_script(script):
+    low = (script or "").lower()
+    if "train" not in low:
+        return False
+    return "yolo" in low or "ultralytics" in low
+
+
+def _append_train_line(job, line, replace):
+    line = _redact_secrets(_ANSI_RE.sub("", line).replace("\x00", "")).rstrip()
+    with job.lock:
+        if replace and job.lines:
+            job.lines[-1] = line
+        else:
+            job.lines.append(line)
+            if len(job.lines) > _LOG_LIMIT:
+                job.lines = job.lines[-2000:]
+        run_dir = job.run_dir
+    if run_dir and not replace:
+        try:
+            with open(os.path.join(run_dir, "train.log"), "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+
+def _pump_train_output(proc, job):
+    stream = proc.stdout
+    buf = b""
+    while True:
+        chunk = stream.read(256)
+        if not chunk:
+            break
+        buf += chunk
+        while True:
+            npos = buf.find(b"\n")
+            rpos = buf.find(b"\r")
+            if npos < 0 and rpos < 0:
+                break
+            if npos < 0:
+                pos, kind = rpos, "r"
+            elif rpos < 0:
+                pos, kind = npos, "n"
+            else:
+                pos, kind = (rpos, "r") if rpos < npos else (npos, "n")
+            line = buf[:pos].decode("utf-8", "replace")
+            buf = buf[pos + 1:]
+            if kind == "r" and buf[:1] == b"\n":
+                buf = buf[1:]
+                kind = "n"
+            _append_train_line(job, line, replace=(kind == "r"))
+    if buf:
+        _append_train_line(job, buf.decode("utf-8", "replace"), replace=False)
+
+
+def _watch_train(proc, job):
+    try:
+        _pump_train_output(proc, job)
+    finally:
+        rc = proc.wait()
+        best, last, _save_dir = _train_ckpt(job.run_dir)
+        with job.lock:
+            job.returncode = rc
+            job.running = False
+            job.done = True
+            job.proc = None
+            if rc not in (0, None) and not job.error:
+                job.error = "Training exited with code {}".format(rc)
+            elif rc == 0 and not best and not last:
+                job.error = (
+                    "Training finished but no checkpoint was written. "
+                    "The script must call model.train(...)."
+                )
+
+
+def _stop_train_proc(proc):
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            proc.terminate()
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return
+        time.sleep(0.2)
+    try:
+        if os.name == "nt":
+            proc.kill()
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _train_status_payload(job, offset=0):
+    with job.lock:
+        run_id = job.run_id
+        run_dir = job.run_dir
+        running = job.running
+        done = job.done
+        error = job.error
+        lines = list(job.lines)
+    offset = max(0, int(offset or 0))
+    chunk = lines[offset:]
+    progress = _train_progress(run_dir) if run_dir else {}
+    best, last, save_dir = _train_ckpt(run_dir, progress) if run_dir else ("", "", None)
+    return {
+        "success": True,
+        "run_id": run_id,
+        "run_dir": run_dir,
+        "save_dir": save_dir,
+        "running": running,
+        "done": done,
+        "error": error,
+        "lines": chunk,
+        "next_offset": offset + len(chunk),
+        "progress": progress,
+        "results": _train_results(save_dir),
+        "best_pt": best or None,
+        "last_pt": last or None,
+    }
+
 
 # ---------------------------------------------------------------------------
 #  Flask routes
@@ -1812,6 +2066,142 @@ def yolo_conf():
     except ValueError as exc:
         return jsonify({"success": False, "error": str(exc)})
     return jsonify({"success": True, "conf": conf})
+
+
+@blueprint.route("/train/start", methods=["POST"])
+def train_start():
+    with _train_job.lock:
+        if _train_job.running:
+            return jsonify({
+                "success": False,
+                "error": "Training is already running",
+                "run_id": _train_job.run_id,
+            })
+
+    data = request.get_json(silent=True) or {}
+    script = (data.get("script") or "").replace("\r\n", "\n")
+    if script.startswith("\ufeff"):
+        script = script[1:]
+    script = script.strip()
+    if not script:
+        return jsonify({"success": False,
+                        "error": "Paste a training script from the YOLO docs"})
+    if len(script) > 1000000:
+        return jsonify({"success": False, "error": "Script is too large"})
+    if not _looks_like_train_script(script):
+        return jsonify({
+            "success": False,
+            "error": "This does not look like a YOLO training script. "
+                     "Paste the Python example from the Ultralytics Train page.",
+        })
+
+    source_cwd = (data.get("cwd") or "").strip() or None
+    if source_cwd:
+        source_cwd = os.path.abspath(source_cwd)
+        if not os.path.isdir(source_cwd):
+            return jsonify({"success": False,
+                            "error": "Script folder not found: " + source_cwd})
+
+    run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
+    run_dir = os.path.join(_TRAIN_ROOT, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+    script_path = os.path.join(run_dir, "script.py")
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(script)
+        f.write("\n")
+
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    cmd = [sys.executable, "-u", _TRAIN_RUNNER, run_dir]
+    if source_cwd:
+        cmd.append(source_cwd)
+
+    popen_kwargs = dict(
+        cwd=run_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        bufsize=0,
+    )
+    if os.name == "nt":
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        if flags:
+            popen_kwargs["creationflags"] = flags
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    try:
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)})
+
+    with _train_job.lock:
+        _train_job.run_id = run_id
+        _train_job.run_dir = run_dir
+        _train_job.proc = proc
+        _train_job.lines = ["Started training run " + run_id]
+        _train_job.running = True
+        _train_job.done = False
+        _train_job.error = None
+        _train_job.returncode = None
+        _train_job.source_cwd = source_cwd
+
+    try:
+        with open(os.path.join(run_dir, "train.log"), "w", encoding="utf-8") as f:
+            f.write("Started training run " + run_id + "\n")
+    except Exception:
+        pass
+
+    threading.Thread(target=_watch_train, args=(proc, _train_job), daemon=True).start()
+    payload = _train_status_payload(_train_job, offset=0)
+    payload["log_reset"] = True
+    return jsonify(payload)
+
+
+@blueprint.route("/train/status")
+def train_status():
+    try:
+        offset = int(request.args.get("offset") or 0)
+    except (TypeError, ValueError):
+        offset = 0
+    return jsonify(_train_status_payload(_train_job, offset=offset))
+
+
+@blueprint.route("/train/stop", methods=["POST"])
+def train_stop():
+    with _train_job.lock:
+        proc = _train_job.proc
+        running = _train_job.running
+        if running:
+            _train_job.error = "Stopped"
+    if running:
+        _stop_train_proc(proc)
+        _append_train_line(_train_job, "Training stopped.", replace=False)
+    payload = _train_status_payload(_train_job, offset=0)
+    payload["lines"] = []
+    return jsonify(payload)
+
+
+@blueprint.route("/train/load-best", methods=["POST"])
+def train_load_best():
+    with _train_job.lock:
+        if _train_job.running:
+            return jsonify({"success": False,
+                            "error": "Wait for training to finish before loading"})
+        run_dir = _train_job.run_dir
+    if not run_dir:
+        return jsonify({"success": False, "error": "No training run yet"})
+    best, last, _save_dir = _train_ckpt(run_dir)
+    path = best or last
+    if not path:
+        return jsonify({"success": False,
+                        "error": "No best.pt (or last.pt) in this run"})
+    try:
+        info = _state.load_yolo(path)
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)})
+    return jsonify({"success": True, **info})
 
 
 @blueprint.route("/learn", methods=["POST"])

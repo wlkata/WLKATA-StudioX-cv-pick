@@ -12,6 +12,7 @@
   var modelFilename  = document.getElementById('cvpick-model-filename');
   var loadBtn     = document.getElementById('cvpick-load-btn');
   var unloadBtn   = document.getElementById('cvpick-unload-btn');
+  var trainBtn    = document.getElementById('cvpick-train-btn');
   var yoloConfInput = document.getElementById('cvpick-yolo-conf');
   var yoloSettings = document.getElementById('cvpick-yolo-settings');
   var learnedList = document.getElementById('cvpick-learned-list');
@@ -1235,6 +1236,266 @@
       });
     });
   }
+
+  (function setupTrainWindow() {
+    var overlay = document.getElementById('cvpick-train-overlay');
+    var closeBtn = document.getElementById('cvpick-train-close');
+    var scriptEl = document.getElementById('cvpick-train-script');
+    var fileEl = document.getElementById('cvpick-train-file');
+    var pickBtn = document.getElementById('cvpick-train-pick');
+    var scriptName = document.getElementById('cvpick-train-script-name');
+    var startBtn = document.getElementById('cvpick-train-start');
+    var stopBtn = document.getElementById('cvpick-train-stop');
+    var loadBtn = document.getElementById('cvpick-train-load');
+    var statusEl = document.getElementById('cvpick-train-status');
+    var logEl = document.getElementById('cvpick-train-log');
+    var runDirEl = document.getElementById('cvpick-train-run-dir');
+    var epochEl = document.getElementById('cvpick-train-epoch');
+    var boxEl = document.getElementById('cvpick-train-box');
+    var map50El = document.getElementById('cvpick-train-map50');
+    var mapEl = document.getElementById('cvpick-train-map');
+    if (!overlay || !trainBtn) return;
+
+    var selectedFile = null;
+    var sourceCwd = null;
+    var pollTimer = null;
+    var logOffset = 0;
+    var runId = null;
+    var stickToBottom = true;
+    var opened = false;
+
+    function setStatus(text, kind) {
+      if (!statusEl) return;
+      statusEl.textContent = text;
+      statusEl.className = 'cvpick-train-status' + (kind ? ' ' + kind : '');
+    }
+
+    function fmt(v, digits) {
+      if (v == null || v === '' || !isFinite(Number(v))) return '\u2014';
+      return Number(v).toFixed(digits);
+    }
+
+    function dirname(p) {
+      if (!p) return null;
+      var i = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+      return i > 0 ? p.slice(0, i) : null;
+    }
+
+    function metric(obj, keys) {
+      if (!obj) return null;
+      for (var i = 0; i < keys.length; i++) {
+        if (obj[keys[i]] != null && obj[keys[i]] !== '') return obj[keys[i]];
+      }
+      return null;
+    }
+
+    function closeTrainWindow() {
+      overlay.hidden = true;
+    }
+
+    function openTrainWindow() {
+      if (overlay.parentNode !== document.body) {
+        document.body.appendChild(overlay);
+      }
+      overlay.hidden = false;
+      if (!opened) {
+        opened = true;
+        logOffset = 0;
+        if (logEl) logEl.textContent = '';
+        ExtensionAPI.fetch('cv-pick', '/train/status?offset=0').then(function (data) {
+          if (data && (data.running || data.done || (data.lines && data.lines.length))) {
+            if (logEl) logEl.textContent = '';
+          }
+          applyStatus(data);
+          if (data && (data.running || (data.lines && data.lines.length))) startPolling();
+        }).catch(function () {});
+      }
+    }
+
+    if (logEl) {
+      logEl.addEventListener('scroll', function () {
+        stickToBottom = (logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight) < 24;
+      });
+    }
+
+    trainBtn.addEventListener('click', openTrainWindow);
+    if (closeBtn) closeBtn.addEventListener('click', closeTrainWindow);
+    overlay.addEventListener('click', function (e) {
+      if (e.target === overlay) closeTrainWindow();
+    });
+
+    if (pickBtn && fileEl) {
+      pickBtn.addEventListener('click', function () { fileEl.click(); });
+      fileEl.addEventListener('change', function () {
+        selectedFile = this.files && this.files[0] ? this.files[0] : null;
+        sourceCwd = selectedFile && selectedFile.path ? dirname(selectedFile.path) : null;
+        if (!selectedFile) {
+          if (scriptName) scriptName.textContent = 'No file — paste a command below';
+          return;
+        }
+        if (scriptName) {
+          scriptName.textContent = selectedFile.name + (sourceCwd ? '  (' + sourceCwd + ')' : '');
+        }
+        var reader = new FileReader();
+        reader.onload = function () {
+          if (scriptEl) scriptEl.value = String(reader.result || '');
+        };
+        reader.readAsText(selectedFile);
+      });
+    }
+
+    function applyStatus(data) {
+      if (!data || !data.success) return;
+      if (data.run_id) runId = data.run_id;
+      if (data.run_dir && runDirEl) runDirEl.textContent = data.run_dir;
+      if (data.log_reset && logEl) {
+        logEl.textContent = '';
+        logOffset = 0;
+      }
+      if (data.lines && data.lines.length && logEl) {
+        var chunk = data.lines.join('\n');
+        logEl.textContent = logEl.textContent ? logEl.textContent + '\n' + chunk : chunk;
+        logOffset = data.next_offset != null ? data.next_offset : logOffset + data.lines.length;
+        if (stickToBottom) logEl.scrollTop = logEl.scrollHeight;
+      } else if (data.next_offset != null) {
+        logOffset = data.next_offset;
+      }
+
+      var p = data.progress || {};
+      var csv = data.results || {};
+      var epochs = p.epochs || csv.epochs || '';
+      var epoch = p.epoch != null ? p.epoch : csv.epoch;
+      if (epochEl) {
+        epochEl.textContent = epoch != null && epoch !== ''
+          ? (epochs ? epoch + ' / ' + epochs : String(epoch))
+          : '\u2014';
+      }
+      if (boxEl) {
+        boxEl.textContent = fmt(metric(csv, ['box_loss']) || metric(p.metrics, ['train/box_loss']), 4);
+      }
+      if (map50El) {
+        map50El.textContent = fmt(
+          metric(p.metrics, ['metrics/mAP50(B)', 'metrics/mAP50']) || csv.map50, 4);
+      }
+      if (mapEl) {
+        mapEl.textContent = fmt(
+          metric(p.metrics, ['metrics/mAP50-95(B)', 'metrics/mAP50-95']) || csv.map50_95, 4);
+      }
+
+      var canLoad = !!(data.best_pt || data.last_pt);
+      if (loadBtn) loadBtn.disabled = !canLoad || !!data.running;
+      if (stopBtn) stopBtn.disabled = !data.running;
+      if (startBtn) startBtn.disabled = !!data.running;
+
+      if (data.running) {
+        setStatus('Training\u2026', 'running');
+      } else if (data.error) {
+        setStatus(data.error, 'error');
+      } else if (data.done && canLoad) {
+        setStatus('Complete \u2014 best checkpoint ready', 'done');
+      } else if (data.done) {
+        setStatus('Finished (no checkpoint written)', 'error');
+      }
+    }
+
+    function poll() {
+      var path = '/train/status?offset=' + encodeURIComponent(String(logOffset));
+      if (runId) path += '&run_id=' + encodeURIComponent(runId);
+      ExtensionAPI.fetch('cv-pick', path).then(function (data) {
+        applyStatus(data);
+        if (data && data.running) {
+          pollTimer = setTimeout(poll, 800);
+        } else if (data && data.success === false) {
+          pollTimer = setTimeout(poll, 1500);
+        } else {
+          pollTimer = null;
+        }
+      }).catch(function () {
+        pollTimer = setTimeout(poll, 1500);
+      });
+    }
+
+    function startPolling() {
+      if (pollTimer) return;
+      poll();
+    }
+
+    if (startBtn) {
+      startBtn.addEventListener('click', function () {
+        var script = (scriptEl && scriptEl.value || '').replace(/^\uFEFF/, '').trim();
+        if (!script) {
+          setStatus('Paste a training command from Ultralytics Platform or the YOLO docs', 'error');
+          return;
+        }
+        startBtn.disabled = true;
+        setStatus('Starting\u2026', 'running');
+        if (logEl) logEl.textContent = '';
+        logOffset = 0;
+        ExtensionAPI.fetch('cv-pick', '/train/start', {
+          method: 'POST',
+          body: JSON.stringify({
+            script: script,
+            cwd: sourceCwd || undefined,
+            filename: selectedFile ? selectedFile.name : undefined
+          })
+        }).then(function (data) {
+          if (!data.success) {
+            startBtn.disabled = false;
+            setStatus(data.error || 'Could not start training', 'error');
+            return;
+          }
+          runId = data.run_id;
+          applyStatus(data);
+          startPolling();
+        }).catch(function () {
+          startBtn.disabled = false;
+          setStatus('Could not start training', 'error');
+        });
+      });
+    }
+
+    if (stopBtn) {
+      stopBtn.addEventListener('click', function () {
+        stopBtn.disabled = true;
+        ExtensionAPI.fetch('cv-pick', '/train/stop', {
+          method: 'POST',
+          body: JSON.stringify({ run_id: runId })
+        }).then(function (data) {
+          applyStatus(data);
+          startPolling();
+        }).catch(function () {
+          stopBtn.disabled = false;
+        });
+      });
+    }
+
+    if (loadBtn) {
+      loadBtn.addEventListener('click', function () {
+        loadBtn.disabled = true;
+        ExtensionAPI.fetch('cv-pick', '/train/load-best', {
+          method: 'POST',
+          body: JSON.stringify({ run_id: runId })
+        }).then(function (data) {
+          if (!data.success) {
+            loadBtn.disabled = false;
+            setStatus(data.error || 'Failed to load checkpoint', 'error');
+            return;
+          }
+          setStatus('Loaded ' + (data.filename || 'best.pt') +
+            ' (' + (data.classes || 0) + ' classes)', 'done');
+          if (data.filename) setModelFilename(data.filename);
+          refreshLearned();
+          refreshPickTargets();
+          ExtensionAPI.showNotification(
+            'Loaded YOLO26n (' + (data.classes || 0) + ' classes)',
+            'info');
+        }).catch(function () {
+          loadBtn.disabled = false;
+          setStatus('Failed to load checkpoint', 'error');
+        });
+      });
+    }
+  })();
 
   // ---- learned-items list -----------------------------------------------
 

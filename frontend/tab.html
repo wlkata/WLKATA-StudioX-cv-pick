@@ -65,6 +65,7 @@
         <div class="cvpick-yolo-row">
           <button type="button" id="cvpick-load-btn" class="cvpick-model-btn cvpick-model-btn-primary" disabled>Load</button>
           <button type="button" id="cvpick-unload-btn" class="cvpick-model-btn">Unload</button>
+          <button type="button" id="cvpick-train-btn" class="cvpick-model-btn" title="Train a YOLO26n model from a Ultralytics script">Train</button>
           <label class="cvpick-settings-label" for="cvpick-yolo-conf">Threshold</label>
           <input id="cvpick-yolo-conf" class="cvpick-lift-input cvpick-yolo-conf" type="number" min="0.05" max="0.95" step="0.05" value="0.25" title="Minimum detection confidence (0.05–0.95)" />
         </div>
@@ -199,6 +200,54 @@
         <button id="cvpick-pick-stop" class="cvpick-btn-secondary" disabled>Stop</button>
       </div>
       <div id="cvpick-pick-progress" class="cvpick-pick-progress"></div>
+    </div>
+  </div>
+</div>
+
+<div id="cvpick-train-overlay" class="cvpick-train-overlay" hidden>
+  <div class="cvpick-train-window" role="dialog" aria-labelledby="cvpick-train-title">
+    <div class="cvpick-train-titlebar">
+      <span id="cvpick-train-title">Train YOLO26n</span>
+      <button type="button" id="cvpick-train-close" class="cvpick-train-close" title="Close">&times;</button>
+    </div>
+    <div class="cvpick-train-body">
+      <p class="cvpick-train-lead">
+        Paste the command from Ultralytics Platform <strong>Train local</strong>,
+        or a Python script from the Train docs.
+        Training runs in a dedicated folder on this machine; when it finishes you can load <code>best.pt</code>.
+      </p>
+      <div class="cvpick-train-row">
+        <button type="button" id="cvpick-train-pick" class="cvpick-model-btn">Select script</button>
+        <span id="cvpick-train-script-name" class="cvpick-train-path">No file — paste a command below</span>
+      </div>
+      <input id="cvpick-train-file" type="file" accept=".py,.txt,.sh" hidden />
+      <textarea id="cvpick-train-script" class="cvpick-train-script" spellcheck="false">export ULTRALYTICS_API_KEY="YOUR_API_KEY"
+yolo train \
+  model="ul://ultralytics/yolo26/yolo26n" \
+  data="ul://ultralytics/datasets/coco8" \
+  task="detect" \
+  epochs=100 \
+  batch=-1 \
+  imgsz=640 \
+  project="username/your-project"
+</textarea>
+      <p class="cvpick-train-lead">
+        Outputs:
+        <span id="cvpick-train-run-dir" class="cvpick-train-path">a new folder in the extension _train directory</span>
+      </p>
+      <div class="cvpick-train-row">
+        <button type="button" id="cvpick-train-start" class="cvpick-model-btn cvpick-model-btn-primary">Start training</button>
+        <button type="button" id="cvpick-train-stop" class="cvpick-model-btn cvpick-train-btn-stop" disabled>Stop</button>
+        <button type="button" id="cvpick-train-load" class="cvpick-model-btn cvpick-train-btn-load" disabled>Load best checkpoint</button>
+        <span id="cvpick-train-status" class="cvpick-train-status">Idle</span>
+      </div>
+      <div class="cvpick-train-metrics">
+        <div class="cvpick-train-metric"><span>Epoch</span><strong id="cvpick-train-epoch">&mdash;</strong></div>
+        <div class="cvpick-train-metric"><span>Box loss</span><strong id="cvpick-train-box">&mdash;</strong></div>
+        <div class="cvpick-train-metric"><span>mAP50</span><strong id="cvpick-train-map50">&mdash;</strong></div>
+        <div class="cvpick-train-metric"><span>mAP50-95</span><strong id="cvpick-train-map">&mdash;</strong></div>
+      </div>
+      <pre id="cvpick-train-log" class="cvpick-train-log">Waiting to start…</pre>
     </div>
   </div>
 </div>

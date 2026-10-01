@@ -1,4 +1,4 @@
 opencv-python>=4.8
 numpy
 pygrabber>=0.1; platform_system=="Windows"
-ultralytics>=8.3.0
+ultralytics>=8.4.35
