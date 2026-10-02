@@ -39,11 +39,31 @@
         </div>
       </div>
     </div>
+    <div class="cvpick-settings">
+      <h3 class="cvpick-section-title">Settings</h3>
+      <div class="cvpick-settings-row">
+        <label class="cvpick-settings-label" for="cvpick-lift-height">Lift height</label>
+        <input id="cvpick-lift-height" class="cvpick-lift-input" type="number" min="1" max="100" step="1" value="10" title="Height above the object and drop while moving" />
+      </div>
+      <div class="cvpick-settings-row">
+        <span class="cvpick-settings-label">Scan</span>
+        <div class="cvpick-scan-switch" role="group" aria-label="Scan mode">
+          <button type="button" id="cvpick-scan-once" class="cvpick-scan-btn active" title="Detect all objects once, then pick that list">Once</button>
+          <button type="button" id="cvpick-scan-each" class="cvpick-scan-btn" title="Detect, pick one object, then detect again">Each pick</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <div class="cvpick-right">
     <div class="cvpick-section cvpick-jog-section">
       <h3 class="cvpick-section-title">Robot Control</h3>
+      <div class="cvpick-device-row">
+        <select id="cvpick-robot-select" class="cvpick-select" title="Robotic arm">
+          <option value="">-- select a robot --</option>
+        </select>
+        <button type="button" id="cvpick-robot-refresh" class="cvpick-btn-secondary cvpick-refresh-btn" title="Refresh">&#8635;</button>
+      </div>
       <div class="cvpick-jog-axes">
         <div class="cvpick-jog-axis">
           <span class="cvpick-jog-label">X</span>
@@ -69,7 +89,7 @@
             <button class="cvpick-jog-step active" data-step="5">5</button>
             <button class="cvpick-jog-step" data-step="10">10</button>
           </div>
-          <span class="cvpick-jog-unit">mm</span>
+          <input id="cvpick-jog-step-custom" class="cvpick-jog-step-input" type="number" min="1" max="50" step="1" value="5" title="Custom step size (1–50)" />
         </div>
         <div class="cvpick-jog-pump-row">
           <button id="cvpick-pump-on" class="cvpick-btn-secondary cvpick-pump-btn">Suction ON</button>
@@ -86,9 +106,9 @@
       </div>
     </div>
     <div class="cvpick-section">
-      <h3 class="cvpick-section-title">Learned Items</h3>
+      <h3 id="cvpick-learned-title" class="cvpick-section-title">Learned Colors</h3>
       <div id="cvpick-learned-list">
-        <p class="cvpick-empty">No items learned yet. Place an object in the zone and click Learn.</p>
+        <p class="cvpick-empty">No colors learned yet. Place an object in the zone and click Learn.</p>
       </div>
     </div>
 
@@ -96,7 +116,7 @@
       <h3 class="cvpick-section-title">Calibration</h3>
       <p class="cvpick-calib-hint">Place 3 markers in an L-shape and map each to the robot's position.</p>
 
-      <button id="cvpick-calib-detect" class="cvpick-btn-primary cvpick-calib-detect-btn">Detect Markers</button>
+      <button id="cvpick-calib-detect" class="cvpick-btn-primary cvpick-calib-detect-btn" disabled title="Switch to Detect mode to detect markers">Detect Markers</button>
 
       <div class="cvpick-calib-points">
         <div class="cvpick-calib-point">
@@ -105,7 +125,10 @@
             <span id="cvpick-calib-px-a" class="cvpick-calib-value">—</span>
           </div>
           <div class="cvpick-calib-robot-row">
-            <span id="cvpick-calib-robot-a" class="cvpick-calib-value">—</span>
+            <div class="cvpick-calib-pose">
+              <span id="cvpick-calib-robot-a" class="cvpick-calib-value">—</span>
+              <button id="cvpick-calib-goto-a" class="cvpick-btn-secondary cvpick-calib-record-btn" hidden disabled>Move to</button>
+            </div>
             <button id="cvpick-calib-record-a" class="cvpick-btn-secondary cvpick-calib-record-btn" disabled>Record A</button>
           </div>
         </div>
@@ -115,7 +138,10 @@
             <span id="cvpick-calib-px-b" class="cvpick-calib-value">—</span>
           </div>
           <div class="cvpick-calib-robot-row">
-            <span id="cvpick-calib-robot-b" class="cvpick-calib-value">—</span>
+            <div class="cvpick-calib-pose">
+              <span id="cvpick-calib-robot-b" class="cvpick-calib-value">—</span>
+              <button id="cvpick-calib-goto-b" class="cvpick-btn-secondary cvpick-calib-record-btn" hidden disabled>Move to</button>
+            </div>
             <button id="cvpick-calib-record-b" class="cvpick-btn-secondary cvpick-calib-record-btn" disabled>Record B</button>
           </div>
         </div>
@@ -125,7 +151,10 @@
             <span id="cvpick-calib-px-c" class="cvpick-calib-value">—</span>
           </div>
           <div class="cvpick-calib-robot-row">
-            <span id="cvpick-calib-robot-c" class="cvpick-calib-value">—</span>
+            <div class="cvpick-calib-pose">
+              <span id="cvpick-calib-robot-c" class="cvpick-calib-value">—</span>
+              <button id="cvpick-calib-goto-c" class="cvpick-btn-secondary cvpick-calib-record-btn" hidden disabled>Move to</button>
+            </div>
             <button id="cvpick-calib-record-c" class="cvpick-btn-secondary cvpick-calib-record-btn" disabled>Record C</button>
           </div>
         </div>
@@ -141,6 +170,12 @@
         <span class="cvpick-calib-label">Drop position</span>
         <span id="cvpick-drop-pos" class="cvpick-calib-value">&mdash;</span>
         <button id="cvpick-drop-set" class="cvpick-btn-secondary cvpick-calib-record-btn">Set</button>
+      </div>
+      <div class="cvpick-pick-one-row">
+        <select id="cvpick-pick-select" class="cvpick-select" title="Group to pick">
+          <option value="">-- select group --</option>
+        </select>
+        <button id="cvpick-pick-one" class="cvpick-btn-primary" disabled>Pick Group</button>
       </div>
       <div class="cvpick-pick-actions">
         <button id="cvpick-pick-all" class="cvpick-btn-primary" disabled>Pick All</button>

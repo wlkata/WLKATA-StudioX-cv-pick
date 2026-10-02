@@ -25,9 +25,15 @@
   var calibRobotB    = document.getElementById('cvpick-calib-robot-b');
   var calibRecordA   = document.getElementById('cvpick-calib-record-a');
   var calibRecordB   = document.getElementById('cvpick-calib-record-b');
+  var calibGotoA     = document.getElementById('cvpick-calib-goto-a');
+  var calibGotoB     = document.getElementById('cvpick-calib-goto-b');
   var calibPxC       = document.getElementById('cvpick-calib-px-c');
   var calibRobotC    = document.getElementById('cvpick-calib-robot-c');
   var calibRecordC   = document.getElementById('cvpick-calib-record-c');
+  var calibGotoC     = document.getElementById('cvpick-calib-goto-c');
+  var liftInput      = document.getElementById('cvpick-lift-height');
+  var scanOnceBtn    = document.getElementById('cvpick-scan-once');
+  var scanEachBtn    = document.getElementById('cvpick-scan-each');
   var calibSaveBtn   = document.getElementById('cvpick-calib-save');
   var calibStatus    = document.getElementById('cvpick-calib-status');
   var markerA        = document.getElementById('cvpick-marker-a');
@@ -35,20 +41,185 @@
   var markerC        = document.getElementById('cvpick-marker-c');
 
   var polling = false;
+  var currentMode = 'color';
+  var currentPhase = 'learning';
+  var LIFT_MIN = 1;
+  var LIFT_MAX = 100;
+  var liftHeight = 10;
+  var scanEach = false;
+  var pickRunning = false;
+
+  function clampLift(v) {
+    if (!isFinite(v)) return null;
+    if (v < LIFT_MIN) return LIFT_MIN;
+    if (v > LIFT_MAX) return LIFT_MAX;
+    return v;
+  }
+
+  function savePickSettings() {
+    ExtensionAPI.setData('cv-pick', 'pickSettings', {
+      liftHeight: liftHeight,
+      scanEach: scanEach
+    });
+  }
+
+  function applyLiftHeight(raw, writeInput) {
+    var clamped = clampLift(raw);
+    if (clamped == null) return false;
+    liftHeight = clamped;
+    if (writeInput && liftInput) liftInput.value = String(clamped);
+    savePickSettings();
+    return true;
+  }
+
+  function setScanEach(on) {
+    scanEach = !!on;
+    if (scanOnceBtn) scanOnceBtn.classList.toggle('active', !scanEach);
+    if (scanEachBtn) scanEachBtn.classList.toggle('active', scanEach);
+    savePickSettings();
+  }
+
+  (function loadPickSettings() {
+    var s = ExtensionAPI.getData('cv-pick', 'pickSettings');
+    if (s) {
+      if (s.liftHeight != null) {
+        var lh = clampLift(parseFloat(s.liftHeight));
+        if (lh != null) liftHeight = lh;
+      }
+      if (s.scanEach) scanEach = true;
+    }
+    if (liftInput) liftInput.value = String(liftHeight);
+    if (scanOnceBtn) scanOnceBtn.classList.toggle('active', !scanEach);
+    if (scanEachBtn) scanEachBtn.classList.toggle('active', scanEach);
+  })();
+
+  if (liftInput) {
+    liftInput.addEventListener('input', function () {
+      var raw = parseFloat(this.value);
+      if (!isFinite(raw)) return;
+      if (raw > LIFT_MAX) {
+        this.value = String(LIFT_MAX);
+        applyLiftHeight(LIFT_MAX, false);
+      } else if (raw >= LIFT_MIN) {
+        applyLiftHeight(raw, false);
+      }
+    });
+    liftInput.addEventListener('change', function () {
+      var clamped = clampLift(parseFloat(this.value));
+      if (clamped == null) clamped = liftHeight;
+      this.value = String(clamped);
+      applyLiftHeight(clamped, false);
+    });
+  }
+  if (scanOnceBtn) {
+    scanOnceBtn.addEventListener('click', function () { setScanEach(false); });
+  }
+  if (scanEachBtn) {
+    scanEachBtn.addEventListener('click', function () { setScanEach(true); });
+  }
 
   // ---- robot jog controls -----------------------------------------------
 
   var jogStep = 5;
   var jogBusy = false;
   var pumpOn  = false;
+  var selectedPort = ExtensionAPI.getData('cv-pick', 'selectedPort') || null;
+  var robotSelect  = document.getElementById('cvpick-robot-select');
+  var robotRefresh = document.getElementById('cvpick-robot-refresh');
 
-  // Step selector
+  function withPort(body) {
+    if (selectedPort) body.port = selectedPort;
+    return body;
+  }
+
+  function requirePort() {
+    if (selectedPort) return selectedPort;
+    ExtensionAPI.showNotification('Select a robotic arm first', 'error');
+    return null;
+  }
+
+  function loadRobots() {
+    ExtensionAPI.getDevices().then(function (data) {
+      if (!data.success || !data.ports) return;
+      var prev = selectedPort || robotSelect.value;
+      robotSelect.innerHTML = '<option value="">-- select a robot --</option>';
+      data.ports.forEach(function (d) {
+        if (!d.connected) return;
+        var opt = document.createElement('option');
+        opt.value = d.port;
+        opt.textContent = d.model + ' (' + d.port + ')';
+        robotSelect.appendChild(opt);
+      });
+      if (prev) robotSelect.value = prev;
+      if (!robotSelect.value) {
+        var def = ExtensionAPI.pickDefaultPort(data.ports);
+        if (def) robotSelect.value = def;
+      }
+      selectedPort = robotSelect.value || null;
+      if (selectedPort) ExtensionAPI.setData('cv-pick', 'selectedPort', selectedPort);
+    }).catch(function () {});
+  }
+
+  robotSelect.addEventListener('change', function () {
+    selectedPort = robotSelect.value || null;
+    ExtensionAPI.setData('cv-pick', 'selectedPort', selectedPort);
+  });
+  robotRefresh.addEventListener('click', loadRobots);
+  loadRobots();
+  ExtensionAPI.onActivate('cv-pick', loadRobots);
+
+  // Step selector (presets + custom 1–50)
+  var STEP_MIN = 1;
+  var STEP_MAX = 50;
   var stepBtns = document.querySelectorAll('.cvpick-jog-step');
+  var stepInput = document.getElementById('cvpick-jog-step-custom');
+
+  function clampJogStep(step) {
+    if (!isFinite(step)) return null;
+    if (step < STEP_MIN) return STEP_MIN;
+    if (step > STEP_MAX) return STEP_MAX;
+    return step;
+  }
+
+  function applyJogStep(step, fromPreset) {
+    var clamped = clampJogStep(step);
+    if (clamped == null) return false;
+    jogStep = clamped;
+    var matched = false;
+    for (var k = 0; k < stepBtns.length; k++) {
+      var btnStep = parseFloat(stepBtns[k].getAttribute('data-step'));
+      var on = btnStep === clamped;
+      stepBtns[k].classList.toggle('active', on);
+      if (on) matched = true;
+    }
+    if (stepInput) {
+      if (fromPreset) stepInput.value = String(clamped);
+      stepInput.classList.toggle('custom-active', !matched);
+    }
+    return true;
+  }
+
   for (var si = 0; si < stepBtns.length; si++) {
     stepBtns[si].addEventListener('click', function () {
-      for (var k = 0; k < stepBtns.length; k++) stepBtns[k].classList.remove('active');
-      this.classList.add('active');
-      jogStep = parseInt(this.getAttribute('data-step'), 10);
+      applyJogStep(parseFloat(this.getAttribute('data-step')), true);
+    });
+  }
+  if (stepInput) {
+    stepInput.addEventListener('input', function () {
+      var raw = parseFloat(this.value);
+      if (!isFinite(raw)) return;
+      if (raw > STEP_MAX) {
+        this.value = String(STEP_MAX);
+        applyJogStep(STEP_MAX, false);
+      } else if (raw >= STEP_MIN) {
+        applyJogStep(raw, false);
+      }
+    });
+    stepInput.addEventListener('change', function () {
+      var clamped = clampJogStep(parseFloat(this.value));
+      if (clamped == null) clamped = jogStep;
+      this.value = String(clamped);
+      applyJogStep(clamped, false);
     });
   }
 
@@ -57,6 +228,7 @@
   for (var ji = 0; ji < jogBtns.length; ji++) {
     jogBtns[ji].addEventListener('click', function () {
       if (jogBusy) return;
+      if (!requirePort()) return;
       var axis = this.getAttribute('data-axis').toUpperCase();
       var dir  = parseInt(this.getAttribute('data-dir'), 10);
       jogBusy = true;
@@ -64,7 +236,7 @@
       fetch(ExtensionAPI.getServerUrl() + '/cmd/jog', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: 'coord', axis: axis, step: dir * jogStep })
+        body: JSON.stringify(withPort({ mode: 'coord', axis: axis, step: dir * jogStep }))
       }).then(function () { jogBusy = false; })
         .catch(function () { jogBusy = false; });
     });
@@ -74,12 +246,14 @@
   var pumpOnBtn  = document.getElementById('cvpick-pump-on');
   var pumpOffBtn = document.getElementById('cvpick-pump-off');
   pumpOnBtn.addEventListener('click', function () {
+    if (!requirePort()) return;
     cmdPump(1);
     pumpOn = true;
     pumpOnBtn.classList.add('pump-active');
     pumpOffBtn.classList.remove('pump-active');
   });
   pumpOffBtn.addEventListener('click', function () {
+    if (!requirePort()) return;
     cmdPump(0);
     pumpOn = false;
     pumpOffBtn.classList.add('pump-active');
@@ -285,9 +459,24 @@
     updateRoiVisual();
   }
 
+  function selectedCameraName() {
+    if (!cameraSelect || cameraSelect.selectedIndex < 0) return '';
+    var opt = cameraSelect.options[cameraSelect.selectedIndex];
+    return (opt && opt.textContent) || '';
+  }
+
+  function cameraNameSet(payload) {
+    var set = {};
+    var cams = (payload && payload.cameras) || [];
+    for (var i = 0; i < cams.length; i++) {
+      var n = (cams[i] && typeof cams[i] === 'object') ? cams[i].name : '';
+      if (n) set[n] = true;
+    }
+    return set;
+  }
+
   function populateCameras(data) {
     if (!data || !data.success || !cameraSelect) return;
-    var prev = cameraSelect.value;
     cameraMeta = {};
     cameraSelect.innerHTML = '';
     (data.cameras || []).forEach(function (cam) {
@@ -307,17 +496,41 @@
       opt.textContent = name;
       cameraSelect.appendChild(opt);
     });
-    if (data.current !== null && data.current !== undefined) {
+  }
+
+  function restoreCameraSelection(data, keepName, oldNames) {
+    if (!cameraSelect) return;
+    if (data && data.current !== null && data.current !== undefined) {
       cameraSelect.value = String(data.current);
-    } else if (prev !== '' && cameraSelect.querySelector('option[value="' + prev + '"]')) {
-      cameraSelect.value = prev;
+      return;
+    }
+    var cams = (data && data.cameras) || [];
+    if (oldNames) {
+      for (var i = 0; i < cams.length; i++) {
+        var n = (cams[i] && cams[i].name) || '';
+        if (n && !oldNames[n] && cams[i].index !== undefined
+            && cams[i].index !== null && cams[i].index !== '') {
+          cameraSelect.value = String(cams[i].index);
+          return;
+        }
+      }
+    }
+    if (keepName) {
+      for (var j = 0; j < cameraSelect.options.length; j++) {
+        if (cameraSelect.options[j].textContent === keepName) {
+          cameraSelect.selectedIndex = j;
+          return;
+        }
+      }
     }
   }
 
-  function applyCameraList(data) {
+  function applyCameraList(data, opts) {
+    opts = opts || {};
     if (!data || !data.success) return false;
     lastCameraPayload = data;
     populateCameras(data);
+    restoreCameraSelection(data, opts.keepName, opts.oldNames);
     return !!(data.cameras && data.cameras.length);
   }
 
@@ -336,19 +549,17 @@
   function mergeCameraPayload(prev, fresh) {
     if (!fresh || !fresh.success) return prev;
     if (!prev || !prev.cameras || !prev.cameras.length) return fresh;
-    var byIndex = {};
-    function put(cam) {
-      var idx = (cam && typeof cam === 'object') ? cam.index : cam;
-      if (idx === undefined || idx === null || idx === '') return;
-      byIndex[String(idx)] = (cam && typeof cam === 'object')
-        ? cam
-        : { index: idx, name: 'Camera ' + idx };
-    }
-    (prev.cameras || []).forEach(put);
-    (fresh.cameras || []).forEach(put);
-    var cameras = Object.keys(byIndex).sort(function (a, b) {
-      return parseInt(a, 10) - parseInt(b, 10);
-    }).map(function (k) { return byIndex[k]; });
+    // Fresh enumerate is the occupancy source (OS index + name).
+    // Do not keep stale prev-at-index-0 (OBS) after USB takes that slot.
+    var prevByName = {};
+    (prev.cameras || []).forEach(function (cam) {
+      if (cam && cam.name) prevByName[cam.name] = cam;
+    });
+    var cameras = (fresh.cameras || []).map(function (cam) {
+      if (!cam || typeof cam !== 'object') return cam;
+      if (cam.resolutions && cam.resolutions.length) return cam;
+      return prevByName[cam.name] || cam;
+    });
     return {
       success: true,
       cameras: cameras,
@@ -543,6 +754,39 @@
     openCamera(idx);
   });
 
+  function discoverThenStart() {
+    var keepName = selectedCameraName();
+    var oldNames = cameraNameSet(lastCameraPayload);
+    var skip = cachedCameraIndices();
+    var q = '?discover=1';
+    if (skip.length) q += '&skip=' + encodeURIComponent(skip.join(','));
+    setCameraBusy(true);
+    setPlaceholder('Loading camera\u2026', true);
+    return loadCameras(q).then(function (data) {
+      if (data && data.success) {
+        data = lastCameraPayload
+          ? mergeCameraPayload(lastCameraPayload, data)
+          : data;
+        applyCameraList(data, { keepName: keepName, oldNames: oldNames });
+      }
+      var idx = parseInt(cameraSelect.value, 10);
+      if (isNaN(idx)) {
+        setCameraBusy(false);
+        ExtensionAPI.showNotification('Select a camera first', 'error');
+        return false;
+      }
+      return openCamera(idx);
+    }).catch(function () {
+      var idx = parseInt(cameraSelect.value, 10);
+      if (isNaN(idx)) {
+        setCameraBusy(false);
+        setPlaceholder('Backend not reachable', false);
+        return false;
+      }
+      return openCamera(idx);
+    });
+  }
+
   if (cameraStartBtn) {
     cameraStartBtn.addEventListener('click', function () {
       if (cameraBusy) return;
@@ -550,12 +794,7 @@
         stopCameraStream();
         return;
       }
-      var idx = parseInt(cameraSelect.value, 10);
-      if (isNaN(idx)) {
-        ExtensionAPI.showNotification('Select a camera first', 'error');
-        return;
-      }
-      openCamera(idx);
+      discoverThenStart();
     });
   }
 
@@ -637,10 +876,10 @@
 
   var refreshTimer = null;
 
-  function showListResult(data, hadCache) {
+  function showListResult(data, hadCache, keepName, oldNames) {
     setCameraBusy(false);
     if (data && data.success) {
-      applyCameraList(data);
+      applyCameraList(data, { keepName: keepName, oldNames: oldNames });
       if (!data.cameras || !data.cameras.length) {
         setPlaceholder('No cameras found', false);
       } else {
@@ -661,6 +900,8 @@
     var req = ++listRequestId;
     var hadCache = !!(lastCameraPayload && lastCameraPayload.cameras &&
       lastCameraPayload.cameras.length);
+    var keepName = selectedCameraName();
+    var oldNames = cameraNameSet(lastCameraPayload);
 
     ExtensionAPI.fetch('cv-pick', '/roi').then(function (data) {
       if (data.success && data.roi && data.roi.length === 4) {
@@ -675,7 +916,7 @@
     if (resSelect) resSelect.innerHTML = '';
 
     if (hadCache) {
-      applyCameraList(lastCameraPayload);
+      applyCameraList(lastCameraPayload, { keepName: keepName });
       setCameraBusy(false);
       setIdlePlaceholder('Select a camera and click Start');
     } else {
@@ -700,7 +941,7 @@
         }
         if (data && data.success) lastCameraPayload = data;
         if (req !== listRequestId) return;
-        showListResult(data, hadCache);
+        showListResult(data, hadCache, keepName, oldNames);
       }).catch(function () {
         if (req !== listRequestId) return;
         setCameraBusy(false);
@@ -711,7 +952,10 @@
     (stopPromise || Promise.resolve()).then(afterStop).catch(afterStop);
 
     if (!refreshTimer) {
-      refreshTimer = setInterval(refreshLearned, 3000);
+      refreshTimer = setInterval(function () {
+        refreshLearned();
+        refreshPickTargets();
+      }, 3000);
     }
   }
 
@@ -741,12 +985,15 @@
   // ---- mode toggle ------------------------------------------------------
 
   function setMode(mode) {
+    currentMode = mode;
     colorBtn.classList.toggle('active', mode === 'color');
     shapeBtn.classList.toggle('active', mode === 'shape');
     ExtensionAPI.fetch('cv-pick', '/mode', {
       method: 'POST',
       body: JSON.stringify({ mode: mode })
     });
+    refreshLearned();
+    refreshPickTargets();
   }
 
   colorBtn.addEventListener('click', function () { setMode('color'); });
@@ -755,6 +1002,7 @@
   // ---- phase toggle (learning / inference) ------------------------------
 
   function setPhase(phase) {
+    currentPhase = phase;
     learnPhBtn.classList.toggle('active', phase === 'learning');
     detectPhBtn.classList.toggle('active', phase === 'inference');
     learnControls.style.display = phase === 'learning' ? '' : 'none';
@@ -762,6 +1010,13 @@
       method: 'POST',
       body: JSON.stringify({ phase: phase })
     });
+    if (phase === 'learning') {
+      calibState.pixelA = null;
+      calibState.pixelB = null;
+      calibState.pixelC = null;
+      updateCalibUI();
+    }
+    updateCalibDetectBtn();
   }
 
   learnPhBtn.addEventListener('click', function () { setPhase('learning'); });
@@ -803,16 +1058,27 @@
   // ---- learned-items list -----------------------------------------------
 
   function refreshLearned() {
+    var kind = currentMode === 'shape' ? 'shapes' : 'colors';
+    var titleEl = document.getElementById('cvpick-learned-title');
+    if (titleEl) {
+      titleEl.textContent = currentMode === 'shape' ? 'Learned Shapes' : 'Learned Colors';
+    }
+
     ExtensionAPI.fetch('cv-pick', '/learned').then(function (data) {
-      if (!data.success || !data.items || data.items.length === 0) {
+      var items = (data.success && data.items) ? data.items : [];
+      var filtered = items.filter(function (item) {
+        return item.mode === currentMode;
+      });
+
+      if (filtered.length === 0) {
         learnedList.innerHTML =
-          '<p class="cvpick-empty">No items learned yet. '
+          '<p class="cvpick-empty">No ' + kind + ' learned yet. '
           + 'Place an object in the zone and click Learn.</p>';
         return;
       }
 
       var html = '';
-      data.items.forEach(function (item) {
+      filtered.forEach(function (item) {
         // display_color is BGR from OpenCV — swap to RGB for CSS
         var r = item.display_color[2];
         var g = item.display_color[1];
@@ -822,7 +1088,6 @@
         html += '<div class="cvpick-item">'
           + '<span class="cvpick-dot" style="background:' + rgb + '"></span>'
           + '<span class="cvpick-item-name">' + escHtml(item.name) + '</span>'
-          + '<span class="cvpick-item-mode">' + item.mode + '</span>'
           + '<button class="cvpick-item-rm" data-id="' + item.id + '">'
           + '&times;</button>'
           + '</div>';
@@ -887,13 +1152,49 @@
     calibRecordA.disabled = !calibState.pixelA;
     calibRecordB.disabled = !calibState.pixelB;
     calibRecordC.disabled = !calibState.pixelC;
+    if (calibGotoA) {
+      calibGotoA.hidden = !calibState.robotA;
+      calibGotoA.disabled = !calibState.robotA || pickRunning;
+    }
+    if (calibGotoB) {
+      calibGotoB.hidden = !calibState.robotB;
+      calibGotoB.disabled = !calibState.robotB || pickRunning;
+    }
+    if (calibGotoC) {
+      calibGotoC.hidden = !calibState.robotC;
+      calibGotoC.disabled = !calibState.robotC || pickRunning;
+    }
     calibSaveBtn.disabled = !(calibState.pixelA && calibState.pixelB && calibState.pixelC
                               && calibState.robotA && calibState.robotB && calibState.robotC);
     updateMarkers();
+    updateCalibDetectBtn();
+  }
+
+  function updateCalibDetectBtn() {
+    var inDetect = currentPhase === 'inference';
+    calibDetectBtn.disabled = !inDetect || pickRunning;
+    calibDetectBtn.title = inDetect
+      ? 'Detect 3 objects in the zone as calibration markers'
+      : 'Switch to Detect mode to detect markers';
+  }
+
+  function saveCalibPoses() {
+    ExtensionAPI.setData('cv-pick', 'calibPoses', {
+      robotA: calibState.robotA,
+      robotB: calibState.robotB,
+      robotC: calibState.robotC
+    });
   }
 
   // Load existing calibration on startup
   function loadCalibration() {
+    var savedPoses = ExtensionAPI.getData('cv-pick', 'calibPoses');
+    if (savedPoses) {
+      if (savedPoses.robotA) calibState.robotA = savedPoses.robotA;
+      if (savedPoses.robotB) calibState.robotB = savedPoses.robotB;
+      if (savedPoses.robotC) calibState.robotC = savedPoses.robotC;
+      updateCalibUI();
+    }
     ExtensionAPI.fetch('cv-pick', '/calibration').then(function (data) {
       if (data.success && data.calibration) {
         calibStatus.textContent = 'Calibrated';
@@ -902,13 +1203,18 @@
     }).catch(function () {});
   }
 
-  // Detect markers — pick 2 largest detections
+  // Detect markers — pick 3 largest detections (Detect mode only)
   calibDetectBtn.addEventListener('click', function () {
+    if (currentPhase !== 'inference') {
+      ExtensionAPI.showNotification('Switch to Detect mode to detect markers', 'error');
+      return;
+    }
     calibDetectBtn.disabled = true;
     calibDetectBtn.textContent = 'Detecting\u2026';
     ExtensionAPI.fetch('cv-pick', '/detections').then(function (data) {
-      calibDetectBtn.disabled = false;
       calibDetectBtn.textContent = 'Detect Markers';
+      updateCalibDetectBtn();
+      if (currentPhase !== 'inference') return;
       if (!data.success || !data.detections || data.detections.length < 3) {
         ExtensionAPI.showNotification(
           'Need at least 3 detected objects. Learn an item, switch to Detect, and place 3 markers in an L-shape.',
@@ -922,19 +1228,21 @@
       calibState.robotA = null;
       calibState.robotB = null;
       calibState.robotC = null;
+      saveCalibPoses();
       updateCalibUI();
       ExtensionAPI.showNotification(
         'Markers detected: A (red), B (blue), C (green)',
         'info');
     }).catch(function () {
-      calibDetectBtn.disabled = false;
       calibDetectBtn.textContent = 'Detect Markers';
+      updateCalibDetectBtn();
     });
   });
 
   // Record robot position for point A
   calibRecordA.addEventListener('click', function () {
-    ExtensionAPI.getRobotStatus().then(function (status) {
+    if (!requirePort()) return;
+    ExtensionAPI.getRobotStatus(selectedPort).then(function (status) {
       if (!status.success) {
         ExtensionAPI.showNotification(status.error || 'Cannot read robot position', 'error');
         return;
@@ -944,13 +1252,15 @@
         y: status.coordinates.Y,
         z: status.coordinates.Z
       };
+      saveCalibPoses();
       updateCalibUI();
     });
   });
 
   // Record robot position for point B
   calibRecordB.addEventListener('click', function () {
-    ExtensionAPI.getRobotStatus().then(function (status) {
+    if (!requirePort()) return;
+    ExtensionAPI.getRobotStatus(selectedPort).then(function (status) {
       if (!status.success) {
         ExtensionAPI.showNotification(status.error || 'Cannot read robot position', 'error');
         return;
@@ -960,13 +1270,15 @@
         y: status.coordinates.Y,
         z: status.coordinates.Z
       };
+      saveCalibPoses();
       updateCalibUI();
     });
   });
 
   // Record robot position for point C
   calibRecordC.addEventListener('click', function () {
-    ExtensionAPI.getRobotStatus().then(function (status) {
+    if (!requirePort()) return;
+    ExtensionAPI.getRobotStatus(selectedPort).then(function (status) {
       if (!status.success) {
         ExtensionAPI.showNotification(status.error || 'Cannot read robot position', 'error');
         return;
@@ -976,9 +1288,26 @@
         y: status.coordinates.Y,
         z: status.coordinates.Z
       };
+      saveCalibPoses();
       updateCalibUI();
     });
   });
+
+  function gotoCalibPose(pos) {
+    if (!requirePort()) return;
+    if (!pos) return;
+    cmdMove(pos.x, pos.y, pos.z);
+  }
+
+  if (calibGotoA) {
+    calibGotoA.addEventListener('click', function () { gotoCalibPose(calibState.robotA); });
+  }
+  if (calibGotoB) {
+    calibGotoB.addEventListener('click', function () { gotoCalibPose(calibState.robotB); });
+  }
+  if (calibGotoC) {
+    calibGotoC.addEventListener('click', function () { gotoCalibPose(calibState.robotC); });
+  }
 
   // Save calibration
   calibSaveBtn.addEventListener('click', function () {
@@ -1001,7 +1330,8 @@
         calibState.pixelA = null;
         calibState.pixelB = null;
         calibState.pixelC = null;
-        updateMarkers();
+        saveCalibPoses();
+        updateCalibUI();
         ExtensionAPI.showNotification('Calibration saved! Z=' + avgZ.toFixed(1), 'info');
       } else {
         ExtensionAPI.showNotification(data.error || 'Calibration failed', 'error');
@@ -1016,16 +1346,61 @@
   var dropSetBtn   = document.getElementById('cvpick-drop-set');
   var dropPosEl    = document.getElementById('cvpick-drop-pos');
   var pickAllBtn   = document.getElementById('cvpick-pick-all');
+  var pickOneBtn   = document.getElementById('cvpick-pick-one');
+  var pickSelect   = document.getElementById('cvpick-pick-select');
   var pickStopBtn  = document.getElementById('cvpick-pick-stop');
   var pickProgress = document.getElementById('cvpick-pick-progress');
 
   var dropPosition = null;   // {x, y, z}
-  var pickRunning  = false;
   var pickAborted  = false;
 
   function updatePickUI() {
     dropPosEl.textContent = dropPosition ? fmtRobot(dropPosition) : '\u2014';
     pickAllBtn.disabled = !dropPosition || pickRunning;
+    if (pickOneBtn) {
+      pickOneBtn.disabled = !dropPosition || pickRunning || !pickSelect.value;
+    }
+    if (pickSelect) pickSelect.disabled = pickRunning;
+    if (liftInput) liftInput.disabled = pickRunning;
+    if (scanOnceBtn) scanOnceBtn.disabled = pickRunning;
+    if (scanEachBtn) scanEachBtn.disabled = pickRunning;
+    updateCalibUI();
+  }
+
+  function refreshPickTargets() {
+    if (pickRunning || !pickSelect) return;
+    Promise.all([
+      ExtensionAPI.fetch('cv-pick', '/learned'),
+      ExtensionAPI.fetch('cv-pick', '/detections')
+    ]).then(function (results) {
+      if (pickRunning) return;
+      var learned = (results[0] && results[0].success && results[0].items) ? results[0].items : [];
+      var dets = (results[1] && results[1].success && results[1].detections) ? results[1].detections : [];
+      var prev = pickSelect.value;
+
+      var names = [];
+      learned.forEach(function (item) {
+        if (item.mode !== currentMode) return;
+        if (item.name && names.indexOf(item.name) === -1) names.push(item.name);
+      });
+
+      var counts = {};
+      dets.forEach(function (d) {
+        var n = d.name;
+        if (!n) return;
+        counts[n] = (counts[n] || 0) + 1;
+      });
+
+      pickSelect.innerHTML = '<option value="">-- select group --</option>';
+      names.forEach(function (name) {
+        var opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = counts[name] ? (name + ' (' + counts[name] + ')') : name;
+        pickSelect.appendChild(opt);
+      });
+      if (prev) pickSelect.value = prev;
+      updatePickUI();
+    }).catch(function () {});
   }
 
   // Restore saved drop position
@@ -1037,7 +1412,8 @@
 
   // Set drop position from current robot position
   dropSetBtn.addEventListener('click', function () {
-    ExtensionAPI.getRobotStatus().then(function (status) {
+    if (!requirePort()) return;
+    ExtensionAPI.getRobotStatus(selectedPort).then(function (status) {
       if (!status.success) {
         ExtensionAPI.showNotification(status.error || 'Cannot read robot position', 'error');
         return;
@@ -1064,7 +1440,7 @@
     return fetch(_serverUrl + '/cmd/jog', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: 'coord', motion: 1, values: { x: x, y: y, z: z }, isAbsolute: true })
+      body: JSON.stringify(withPort({ mode: 'coord', motion: 1, values: { x: x, y: y, z: z }, isAbsolute: true }))
     });
   }
 
@@ -1072,7 +1448,7 @@
     return fetch(_serverUrl + '/cmd/pump', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: mode })
+      body: JSON.stringify(withPort({ mode: mode }))
     });
   }
 
@@ -1080,7 +1456,7 @@
     var deadline = Date.now() + (timeoutMs || 15000);
     while (Date.now() < deadline) {
       if (pickAborted) return;
-      var st = await ExtensionAPI.getRobotStatus();
+      var st = await ExtensionAPI.getRobotStatus(selectedPort);
       if (st.success && st.state === 'Idle') return;
       await sleep(200);
     }
@@ -1091,122 +1467,222 @@
     pickProgress.classList.toggle('running', !!msg);
   }
 
-  // Pick all sequence
-  pickAllBtn.addEventListener('click', async function () {
-    // Verify calibration exists
-    var calData = await ExtensionAPI.fetch('cv-pick', '/calibration');
-    if (!calData.success || !calData.calibration) {
-      ExtensionAPI.showNotification('Calibrate first before picking', 'error');
-      return;
-    }
-
-    // Detect all objects
-    setProgress('Detecting objects...');
-    var det = await ExtensionAPI.fetch('cv-pick', '/detections');
-    if (!det.success || !det.detections || det.detections.length === 0) {
-      setProgress('');
-      ExtensionAPI.showNotification('No objects detected. Switch to Detect mode and ensure items are visible.', 'error');
-      return;
-    }
-
-    // Convert all pixel positions to robot coords
+  async function detectionsToTargets(detections) {
     var targets = [];
-    for (var i = 0; i < det.detections.length; i++) {
-      var px = det.detections[i].center_px;
+    for (var i = 0; i < detections.length; i++) {
+      var px = detections[i].center_px;
       var pos = await ExtensionAPI.fetch('cv-pick', '/pick-position', {
         method: 'POST',
         body: JSON.stringify({ px: px[0], py: px[1] })
       });
       if (pos.success) {
-        targets.push({ name: det.detections[i].name, pos: pos.position });
+        targets.push({ name: detections[i].name, pos: pos.position });
+      }
+    }
+    return targets;
+  }
+
+  async function fetchPickDetections(groupName) {
+    var det = await ExtensionAPI.fetch('cv-pick', '/detections');
+    var list = (det && det.success && det.detections) ? det.detections : [];
+    if (groupName) {
+      list = list.filter(function (d) { return d.name === groupName; });
+    }
+    return list;
+  }
+
+  async function pickOneObject(target, index, total) {
+    var dz = liftHeight;
+    var d = dropPosition;
+    var t = target.pos;
+    var label = target.name || ('Object ' + index);
+    var suffix = total ? (' (' + index + '/' + total + ')') : (' (' + index + ')');
+    setProgress('Picking ' + label + suffix + '...');
+
+    await cmdMove(t.x, t.y, t.z + dz);
+    await waitIdle();
+    if (pickAborted) return;
+
+    await cmdPump(1);
+    await sleep(300);
+
+    await cmdMove(t.x, t.y, t.z);
+    await waitIdle();
+    if (pickAborted) return;
+    await sleep(200);
+
+    await cmdMove(t.x, t.y, t.z + dz);
+    await waitIdle();
+    if (pickAborted) return;
+
+    setProgress('Dropping ' + label + suffix + '...');
+    await cmdMove(d.x, d.y, d.z + dz);
+    await waitIdle();
+    if (pickAborted) return;
+
+    await cmdMove(d.x, d.y, d.z);
+    await waitIdle();
+    if (pickAborted) return;
+
+    await cmdPump(0);
+    await sleep(300);
+
+    await cmdMove(d.x, d.y, d.z + dz);
+    await waitIdle();
+  }
+
+  function finishPick(picked, total, groupName, aborted) {
+    pickRunning = false;
+    pickStopBtn.disabled = true;
+    updatePickUI();
+
+    if (aborted) {
+      setProgress('Stopped (' + picked + (total ? '/' + total : '') + ' picked)');
+      ExtensionAPI.showNotification('Pick sequence stopped', 'info');
+      return;
+    }
+    var label = groupName || 'objects';
+    var doneMsg = groupName
+      ? ('Done! ' + picked + ' ' + groupName + ' object' + (picked === 1 ? '' : 's') + ' picked')
+      : ('Done! ' + picked + ' objects picked');
+    setProgress(doneMsg);
+    ExtensionAPI.showNotification(
+      groupName ? ('Pick complete: ' + picked + ' ' + label) : ('Pick complete: ' + picked + ' objects'),
+      'info');
+  }
+
+  async function runPickSequence(targets) {
+    pickRunning = true;
+    pickAborted = false;
+    updatePickUI();
+    pickStopBtn.disabled = false;
+
+    var picked = 0;
+    for (var j = 0; j < targets.length; j++) {
+      if (pickAborted) break;
+      await pickOneObject(targets[j], j + 1, targets.length);
+      if (pickAborted) break;
+      picked += 1;
+    }
+
+    await cmdPump(0);
+    var groupName = targets[0] && targets.every(function (t) { return t.name === targets[0].name; })
+      ? targets[0].name : null;
+    finishPick(picked, targets.length, groupName, pickAborted);
+  }
+
+  async function runPickRetake(groupName) {
+    pickRunning = true;
+    pickAborted = false;
+    updatePickUI();
+    pickStopBtn.disabled = false;
+
+    var picked = 0;
+    while (!pickAborted) {
+      setProgress(picked === 0 ? 'Detecting objects...' : 'Scanning for next object...');
+      if (picked > 0) await sleep(600);
+      var dets = await fetchPickDetections(groupName);
+      if (!dets.length) {
+        if (picked === 0) {
+          pickRunning = false;
+          pickStopBtn.disabled = true;
+          updatePickUI();
+          setProgress('');
+          ExtensionAPI.showNotification(
+            groupName
+              ? ('No "' + groupName + '" objects detected. Switch to Detect mode and ensure they are visible.')
+              : 'No objects detected. Switch to Detect mode and ensure items are visible.',
+            'error');
+          return;
+        }
+        break;
+      }
+      var targets = await detectionsToTargets([dets[0]]);
+      if (!targets.length) {
+        if (picked === 0) {
+          pickRunning = false;
+          pickStopBtn.disabled = true;
+          updatePickUI();
+          setProgress('');
+          ExtensionAPI.showNotification('Could not convert positions — check calibration', 'error');
+          return;
+        }
+        break;
+      }
+      picked += 1;
+      await pickOneObject(targets[0], picked, null);
+      if (pickAborted) {
+        picked -= 1;
+        break;
       }
     }
 
+    await cmdPump(0);
+    finishPick(picked, 0, groupName || null, pickAborted);
+  }
+
+  async function ensureCalibrated() {
+    var calData = await ExtensionAPI.fetch('cv-pick', '/calibration');
+    if (!calData.success || !calData.calibration) {
+      ExtensionAPI.showNotification('Calibrate first before picking', 'error');
+      return false;
+    }
+    return true;
+  }
+
+  async function startPicking(groupName) {
+    if (!requirePort()) return;
+    if (!(await ensureCalibrated())) return;
+
+    if (scanEach) {
+      await runPickRetake(groupName);
+      return;
+    }
+
+    setProgress(groupName ? ('Detecting ' + groupName + '...') : 'Detecting objects...');
+    var dets = await fetchPickDetections(groupName);
+    if (!dets.length) {
+      setProgress('');
+      ExtensionAPI.showNotification(
+        groupName
+          ? ('No "' + groupName + '" objects detected. Switch to Detect mode and ensure they are visible.')
+          : 'No objects detected. Switch to Detect mode and ensure items are visible.',
+        'error');
+      return;
+    }
+
+    var targets = await detectionsToTargets(dets);
     if (targets.length === 0) {
       setProgress('');
       ExtensionAPI.showNotification('Could not convert positions — check calibration', 'error');
       return;
     }
 
-    // Start pick loop
-    pickRunning = true;
-    pickAborted = false;
-    pickAllBtn.disabled = true;
-    pickStopBtn.disabled = false;
+    await runPickSequence(targets);
+  }
 
-    var dz = 10;
-    var d = dropPosition;
-
-    for (var j = 0; j < targets.length; j++) {
-      if (pickAborted) break;
-
-      var t = targets[j].pos;
-      var label = targets[j].name || ('Object ' + (j + 1));
-      setProgress('Picking ' + label + ' (' + (j + 1) + '/' + targets.length + ')...');
-
-      // Move above target
-      await cmdMove(t.x, t.y, t.z + dz);
-      await waitIdle();
-      if (pickAborted) break;
-
-      // Pump on
-      await cmdPump(1);
-      await sleep(300);
-
-      // Lower to pick
-      await cmdMove(t.x, t.y, t.z);
-      await waitIdle();
-      if (pickAborted) break;
-      await sleep(200);
-
-      // Lift up
-      await cmdMove(t.x, t.y, t.z + dz);
-      await waitIdle();
-      if (pickAborted) break;
-
-      // Move to drop position (above)
-      setProgress('Dropping ' + label + ' (' + (j + 1) + '/' + targets.length + ')...');
-      await cmdMove(d.x, d.y, d.z + dz);
-      await waitIdle();
-      if (pickAborted) break;
-
-      // Lower to drop
-      await cmdMove(d.x, d.y, d.z);
-      await waitIdle();
-      if (pickAborted) break;
-
-      // Pump off
-      await cmdPump(0);
-      await sleep(300);
-
-      // Lift up from drop
-      await cmdMove(d.x, d.y, d.z + dz);
-      await waitIdle();
-      if (pickAborted) break;
-    }
-
-    // Done
-    await cmdPump(0);  // ensure pump off
-    pickRunning = false;
-    pickStopBtn.disabled = true;
-    updatePickUI();
-
-    if (pickAborted) {
-      setProgress('Stopped (' + j + '/' + targets.length + ' picked)');
-      ExtensionAPI.showNotification('Pick sequence stopped', 'info');
-    } else {
-      setProgress('Done! ' + targets.length + ' objects picked');
-      ExtensionAPI.showNotification('Pick complete: ' + targets.length + ' objects', 'info');
-    }
+  pickAllBtn.addEventListener('click', async function () {
+    await startPicking(null);
   });
 
-  // Stop button
+  pickSelect.addEventListener('change', updatePickUI);
+
+  pickOneBtn.addEventListener('click', async function () {
+    var name = pickSelect.value;
+    if (!name) {
+      ExtensionAPI.showNotification('Select a group to pick', 'error');
+      return;
+    }
+    await startPicking(name);
+  });
+
   pickStopBtn.addEventListener('click', function () {
     pickAborted = true;
     pickStopBtn.disabled = true;
     setProgress('Stopping...');
-    cmdPump(0);  // turn off pump immediately
+    cmdPump(0);
   });
 
   updatePickUI();
+  refreshPickTargets();
 })();
