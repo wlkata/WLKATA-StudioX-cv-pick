@@ -1,16 +1,20 @@
 """
 CV Pick extension backend.
 
-Real-time color and shape detection with a learning workflow.
-A background thread captures webcam frames, runs detection for every learned
-item, draws bounding-box overlays, and exposes the result as an MJPEG stream.
+Load a local YOLO26n checkpoint and run real-time detection in the ROI.
+Frames come from the camera extension. This process decodes them, draws
+boxes, and exposes the result as JPEG frames.
 """
 
 import base64
+import csv
 import json
 import os
 import platform
+import re
+import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -18,6 +22,11 @@ import uuid
 import cv2
 import numpy as np
 from flask import Blueprint, Response, jsonify, request
+
+from camera_source import connect as camera_connect
+from camera_source import disconnect as camera_disconnect
+from camera_source import latest_jpeg as camera_latest_jpeg
+from camera_source import list_cameras as camera_list
 
 blueprint = Blueprint("cv_pick", __name__)
 
@@ -43,6 +52,74 @@ _PALETTE = [
     (0, 188, 212),    # cyan
     (255, 87, 34),    # deep-orange
 ]
+
+_YOLO26N_MARKERS = ("yolo26n", "yolov26n")
+_YOLO26_OTHER = (
+    "yolo26s", "yolo26m", "yolo26l", "yolo26x",
+    "yolov26s", "yolov26m", "yolov26l", "yolov26x",
+)
+_CKPT_EXTS = (".pt", ".ckpt")
+
+
+def _warmup_yolo_import():
+    """Import torch/ultralytics in the background so Load is not the first hit."""
+    try:
+        import torch  # noqa: F401
+        import ultralytics  # noqa: F401
+    except Exception:
+        pass
+
+
+threading.Thread(target=_warmup_yolo_import, daemon=True).start()
+
+
+def _ckpt_hints(path, model=None):
+    hints = [os.path.basename(path or "").lower()]
+    ckpt = getattr(model, "ckpt", None) if model is not None else None
+    if model is not None:
+        ov = getattr(model, "overrides", None) or {}
+        if ov.get("model"):
+            hints.append(str(ov["model"]).lower())
+        yaml = getattr(getattr(model, "model", None), "yaml", None) or {}
+        if isinstance(yaml, dict):
+            for key in ("yaml_file", "scale"):
+                if yaml.get(key) is not None:
+                    hints.append(str(yaml[key]).lower())
+    if isinstance(ckpt, dict):
+        args = ckpt.get("train_args") or {}
+        for key in ("model", "name"):
+            if args.get(key):
+                hints.append(str(args[key]).lower())
+    # Fine-tunes are saved as weights/best.pt; Ultralytics writes the
+    # original model name into the sibling args.yaml.
+    try:
+        parent = os.path.dirname(os.path.dirname(os.path.abspath(path or "")))
+        args_yaml = os.path.join(parent, "args.yaml")
+        if os.path.isfile(args_yaml):
+            with open(args_yaml, "r", encoding="utf-8") as f:
+                hints.append(f.read().lower())
+    except Exception:
+        pass
+    return " ".join(hints)
+
+
+def _is_yolo26n(path, model=None):
+    blob = _ckpt_hints(path, model)
+    if any(tag in blob for tag in _YOLO26_OTHER):
+        return False
+    if any(tag in blob for tag in _YOLO26N_MARKERS):
+        return True
+    yaml = getattr(getattr(model, "model", None), "yaml", None) or {}
+    if not isinstance(yaml, dict):
+        return False
+    scale = str(yaml.get("scale") or "").lower()
+    yaml_file = str(yaml.get("yaml_file") or "").lower()
+    return scale == "n" and ("yolo26" in yaml_file or "yolov26" in yaml_file)
+
+
+def _allowed_ckpt_filename(name):
+    lower = (name or "").lower()
+    return any(lower.endswith(ext) for ext in _CKPT_EXTS)
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +703,18 @@ def _draw_kept(display, kept, offset=(0, 0)):
         _put_label(display, item["name"], bx, by, bgr)
 
 
+def _draw_yolo_dets(display, dets):
+    for d in dets:
+        x, y, w, h = d["bbox"]
+        bgr = tuple(int(c) for c in d["display_color"])
+        cv2.rectangle(display, (x, y), (x + w, y + h), bgr, 2)
+        label = d["name"]
+        if d.get("conf") is not None:
+            label = "{} {:.2f}".format(label, d["conf"])
+        _put_label(display, label, x, y, bgr)
+    return len(dets)
+
+
 def _detect_colors(frame, display, colors, offset=(0, 0)):
     """Detect learned colours with winner-takes-all NMS.
 
@@ -721,8 +810,10 @@ class _CVState:
         self.learned_colors = []
         self.learned_shapes = []
         self.roi = [0.25, 0.2, 0.75, 0.8]  # normalised [x1, y1, x2, y2]
-        self.camera = None
+        self.camera = None  # unused; frames come from the camera extension
+        self._camera_held = False
         self._camera_index = 0
+        self._start_error = ''
         self._supported_resolutions = []
         self.running = False
         self._thread = None
@@ -737,12 +828,31 @@ class _CVState:
         self._camera_name = ""
         self._lifecycle = threading.Lock()
         self._started_at = 0.0
+        self.yolo_model = None
+        self.yolo_classes = []
+        self.yolo_path = None
+        self.yolo_hidden = set()
+        self.yolo_conf = 0.25
+        self._last_yolo_dets = []
+        self._yolo_infer_lock = threading.Lock()
 
     # -- camera lifecycle --------------------------------------------------
 
     def start(self, camera_index=0):
         with self._lifecycle:
             return self._start_body(camera_index)
+
+    def _decode_jpeg(self, jpeg):
+        if not jpeg:
+            return None
+        frame = cv2.imdecode(
+            np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is None or getattr(frame, 'size', 0) == 0:
+            return None
+        return frame
+
+    def _fetch_frame(self):
+        return self._decode_jpeg(camera_latest_jpeg(self._camera_index))
 
     def _start_body(self, camera_index=0):
         if self.running:
@@ -751,52 +861,30 @@ class _CVState:
             self._stop_body()
 
         idx = int(camera_index)
-        with _device_catalog_lock:
-            cached = dict(_device_catalog.get(idx) or {})
-
-        # Prefer catalog probe from /cameras; re-test if missing.
-        res_list = []
-        default = None
-        if cached.get("resolutions"):
-            res_list = [
-                (int(r["width"]), int(r["height"]))
-                for r in cached["resolutions"]
-                if int(r.get("width") or 0) > 0 and int(r.get("height") or 0) > 0
-            ]
-            d = cached.get("default") or {}
-            if int(d.get("width") or 0) > 0 and int(d.get("height") or 0) > 0:
-                default = (int(d["width"]), int(d["height"]))
-
-        # Open already parked on the known-good size, with MJPG on Windows.
-        if default:
-            cap = _open_capture(idx, default[0], default[1])
-        else:
-            cap = _open_capture(idx)
-        if cap is None or not cap.isOpened():
-            _release_cap(cap)
+        opened = camera_connect(idx)
+        if not opened.get('success'):
+            self._start_error = opened.get('error') or 'Cannot open camera'
             return False
-
-        if not res_list or not default:
-            res_list, default = probe_camera_resolutions(
-                cap, candidates=_CANDIDATE_RESOLUTIONS)
-        if not res_list or not default:
-            _release_cap(cap)
-            return False
-
-        # Park on default (MJPG + size) and wait out black warmup frames.
-        _configure_size(cap, default[0], default[1])
-        size = _read_frame_size(
-            cap, tries=24, require_content=True, pause=0.04)
-        if not size:
-            size = _read_frame_size(cap, tries=8, require_content=False, pause=0.03)
-        if not size:
-            _release_cap(cap)
-            return False
-
-        self.camera = cap
+        self._camera_held = True
         self._camera_index = idx
-        self._camera_name = cached.get("name") or f"Camera {idx}"
-        self._supported_resolutions = sorted(set(res_list) | {size})
+        self._camera_name = opened.get('name') or f'Camera {idx}'
+
+        frame = None
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            frame = self._fetch_frame()
+            if frame is not None and not _is_blank_frame(frame):
+                break
+            time.sleep(0.05)
+        if frame is None:
+            camera_disconnect(idx)
+            self._camera_held = False
+            self._start_error = 'Camera has no frame yet'
+            return False
+
+        height, width = frame.shape[:2]
+        size = (int(width), int(height))
+        self._supported_resolutions = [size]
         self._last_resolution = size
         self._last_resolution_ok = True
         self._pending_resolution = None
@@ -831,31 +919,17 @@ class _CVState:
         Queue a resolution change for the capture thread.
         Returns dict {width, height, reverted} or None.
         """
-        if self.camera is None or not self.running:
+        if not self.running:
             return None
         req = (int(width), int(height))
-        # Reject modes we already know are unsupported.
-        with self.lock:
-            supported = list(self._supported_resolutions)
-        if supported and not any(_resolution_matches(req, s) for s in supported):
-            with self.lock:
-                cw, ch = self._last_resolution
-            return {"width": cw, "height": ch, "reverted": True}
-
-        self._resolution_event.clear()
-        with self.lock:
-            self._pending_resolution = req
-            self._last_resolution_ok = True
-        # Windows reopen can take several seconds.
-        wait_s = 12.0 if _is_windows() else 6.0
-        self._resolution_event.wait(timeout=wait_s)
         with self.lock:
             cw, ch = self._last_resolution
-            ok = self._last_resolution_ok
+        # The camera extension does not change resolution yet. Keep the
+        # size of the frames it is already sending.
         return {
             "width": cw,
             "height": ch,
-            "reverted": (not ok) or (not _resolution_matches(req, (cw, ch))),
+            "reverted": not _resolution_matches(req, (cw, ch)),
         }
 
     def stop(self):
@@ -868,18 +942,13 @@ class _CVState:
         thread = self._thread
         self._thread = None
         if thread is not None:
-            thread.join(timeout=2.5)
-        cap = self.camera
-        self.camera = None
-        if cap is not None:
+            thread.join(timeout=3.0)
+        if self._camera_held:
             try:
-                cap.release()
+                camera_disconnect(self._camera_index)
             except Exception:
                 pass
-        # DirectShow / AVFoundation keep an exclusive lock briefly after
-        # release(); a short pause avoids the next open seeing "busy".
-        if platform.system() in ("Windows", "Darwin"):
-            time.sleep(0.2)
+            self._camera_held = False
         with self.lock:
             self._raw_frame = None
             self._processed_frame = None
@@ -1012,15 +1081,16 @@ class _CVState:
         target_dt = 1.0 / 30
         while self.running:
             t0 = time.monotonic()
-            self._apply_pending_resolution()
-            cap = self.camera
-            if cap is None:
+            frame = self._fetch_frame()
+            if frame is None:
                 time.sleep(0.02)
                 continue
-            ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.01)
-                continue
+            height, width = frame.shape[:2]
+            if width > 0 and height > 0:
+                with self.lock:
+                    if (int(width), int(height)) != tuple(self._last_resolution):
+                        self._last_resolution = (int(width), int(height))
+                        self._supported_resolutions = [self._last_resolution]
 
             with self.lock:
                 self._raw_frame = frame
@@ -1029,8 +1099,8 @@ class _CVState:
                 mode = self.mode
                 phase = self.phase
                 roi = list(self.roi)
-
-            processed = self._process(frame, mode, phase, colors, shapes, roi)
+            processed = self._process(
+                frame, mode, phase, colors, shapes, roi)
 
             # Hold the JPEG feed until auto-exposure produces a real picture.
             if (_is_blank_frame(processed)
@@ -1047,8 +1117,7 @@ class _CVState:
 
     # -- per-frame processing ----------------------------------------------
 
-    @staticmethod
-    def _process(frame, mode, phase, colors, shapes, roi):
+    def _process(self, frame, mode, phase, colors, shapes, roi):
         display = frame.copy()
         fh, fw = frame.shape[:2]
 
@@ -1059,8 +1128,17 @@ class _CVState:
         ry2 = min(fh, int(roi[3] * fh))
 
         count = 0
-        if phase == "learning":
+        if mode == "yolo":
+            roi_frame = frame[ry1:ry2, rx1:rx2]
+            dets = self._run_yolo(roi_frame, rx1, ry1) if roi_frame.size else []
+            with self.lock:
+                self._last_yolo_dets = dets
+            count = _draw_yolo_dets(display, dets)
+            tag = "YOLO26n" if self.yolo_model is not None else "NO YOLO"
+        elif phase == "learning":
             _draw_preview(frame, display, mode, rx1, ry1, rx2, ry2)
+            mode_tag = "COLOR" if mode == "color" else "SHAPE"
+            tag = "LEARN " + mode_tag
         else:
             roi_frame = frame[ry1:ry2, rx1:rx2]
             if roi_frame.size > 0:
@@ -1070,10 +1148,9 @@ class _CVState:
                 elif mode == "shape" and shapes:
                     count = _detect_shapes(roi_frame, display, shapes,
                                            offset=(rx1, ry1))
+            mode_tag = "COLOR" if mode == "color" else "SHAPE"
+            tag = mode_tag
 
-        # HUD
-        mode_tag = "COLOR" if mode == "color" else "SHAPE"
-        tag = ("LEARN " + mode_tag) if phase == "learning" else mode_tag
         cv2.putText(display, tag, (10, 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(display, tag, (10, 24),
@@ -1187,9 +1264,143 @@ class _CVState:
 
     # -- queries -----------------------------------------------------------
 
+    def load_yolo(self, path):
+        path = os.path.abspath(path)
+        if not os.path.isfile(path):
+            raise ValueError("Checkpoint not found")
+        if not _allowed_ckpt_filename(path):
+            raise ValueError("Need a .pt or .ckpt file")
+        try:
+            from ultralytics import YOLO
+        except ImportError:
+            raise ValueError(
+                "ultralytics is not installed. Add it to this extension env.")
+
+        model = YOLO(path)
+        task = getattr(model, "task", "detect") or "detect"
+        if task != "detect":
+            raise ValueError(
+                "Need a YOLO26n detection checkpoint, not task '{}'".format(task))
+        if not _is_yolo26n(path, model):
+            raise ValueError(
+                "Only YOLO26n checkpoints are supported. "
+                "Load a yolo26n.pt (or a YOLO26n fine-tune).")
+
+        names = getattr(model, "names", None) or {}
+        if isinstance(names, dict):
+            pairs = sorted(names.items(), key=lambda kv: int(kv[0]))
+        else:
+            pairs = list(enumerate(names))
+        classes = []
+        for idx, name in pairs:
+            classes.append({
+                "id": "yolo-{}".format(int(idx)),
+                "name": str(name),
+                "mode": "yolo",
+                "class_id": int(idx),
+                "display_color": list(_PALETTE[int(idx) % len(_PALETTE)]),
+            })
+        with self._yolo_infer_lock:
+            with self.lock:
+                self.yolo_model = model
+                self.yolo_classes = classes
+                self.yolo_path = path
+                self.yolo_hidden = set()
+                self._last_yolo_dets = []
+        return {
+            "path": path,
+            "filename": os.path.basename(path),
+            "classes": len(classes),
+            "items": classes,
+        }
+
+    def unload_yolo(self):
+        with self._yolo_infer_lock:
+            with self.lock:
+                self.yolo_model = None
+                self.yolo_classes = []
+                self.yolo_path = None
+                self.yolo_hidden = set()
+                self._last_yolo_dets = []
+
+    def set_yolo_conf(self, conf):
+        try:
+            conf = float(conf)
+        except (TypeError, ValueError):
+            raise ValueError("Threshold must be a number")
+        conf = max(0.05, min(0.95, conf))
+        with self.lock:
+            self.yolo_conf = conf
+        return conf
+
+    def yolo_status(self):
+        with self.lock:
+            status = {"loaded": False, "conf": self.yolo_conf}
+            if self.yolo_model is None:
+                return status
+            status.update({
+                "loaded": True,
+                "path": self.yolo_path,
+                "filename": os.path.basename(self.yolo_path or ""),
+                "classes": len(self.yolo_classes),
+            })
+            return status
+
+    def _run_yolo(self, roi_bgr, ox, oy):
+        with self.lock:
+            model = self.yolo_model
+            classes = list(self.yolo_classes)
+            hidden = set(self.yolo_hidden)
+            conf = self.yolo_conf
+        if model is None or roi_bgr is None or getattr(roi_bgr, "size", 0) == 0:
+            return []
+        class_by_id = {c["class_id"]: c for c in classes}
+        try:
+            with self._yolo_infer_lock:
+                results = model.predict(
+                    roi_bgr, verbose=False, imgsz=640, conf=conf)
+        except Exception:
+            return []
+        if not results:
+            return []
+        boxes = getattr(results[0], "boxes", None)
+        if boxes is None:
+            return []
+        try:
+            xyxy = boxes.xyxy.cpu().numpy()
+            cls = boxes.cls.cpu().numpy()
+            conf = boxes.conf.cpu().numpy()
+        except Exception:
+            return []
+        dets = []
+        for i in range(len(xyxy)):
+            item = class_by_id.get(int(cls[i]))
+            if item is None or item["id"] in hidden:
+                continue
+            x1, y1, x2, y2 = [float(v) for v in xyxy[i]]
+            x, y = int(x1), int(y1)
+            w, h = max(0, int(x2 - x1)), max(0, int(y2 - y1))
+            if w < 2 or h < 2:
+                continue
+            dets.append({
+                "name": item["name"],
+                "mode": "yolo",
+                "center_px": [int(ox + x + w / 2), int(oy + y + h / 2)],
+                "bbox": [ox + x, oy + y, w, h],
+                "area": w * h,
+                "display_color": item["display_color"],
+                "conf": float(conf[i]),
+            })
+        dets.sort(key=lambda d: d["area"], reverse=True)
+        return dets
+
     def learned_list(self):
         with self.lock:
             items = []
+            if self.yolo_model is not None:
+                hidden = set(self.yolo_hidden)
+                items.extend(
+                    dict(c) for c in self.yolo_classes if c["id"] not in hidden)
             for c in self.learned_colors:
                 items.append({k: v for k, v in c.items()})
             for s in self.learned_shapes:
@@ -1202,6 +1413,9 @@ class _CVState:
 
     def remove_item(self, item_id):
         with self.lock:
+            if str(item_id).startswith("yolo-"):
+                self.yolo_hidden.add(item_id)
+                return
             self.learned_colors = [
                 c for c in self.learned_colors if c["id"] != item_id]
             self.learned_shapes = [
@@ -1240,8 +1454,13 @@ class _CVState:
         if roi_frame.size == 0:
             return []
 
+        with self.lock:
+            cached = list(self._last_yolo_dets) if mode == "yolo" else []
+
         results = []
-        if mode == "color" and colors:
+        if mode == "yolo":
+            results = cached if cached else self._run_yolo(roi_frame, rx1, ry1)
+        elif mode == "color" and colors:
             results = self._detect_color_objects(roi_frame, colors, rx1, ry1)
         elif mode == "shape" and shapes:
             results = self._detect_shape_objects(roi_frame, shapes, rx1, ry1)
@@ -1374,6 +1593,246 @@ class _CVState:
 
 _state = _CVState()
 
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+_TRAIN_ROOT = os.path.join(_BACKEND_DIR, "_train")
+_TRAIN_RUNNER = os.path.join(_BACKEND_DIR, "train_runner.py")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_SECRET_RE = re.compile(r"ul_[0-9a-f]{16,}", re.I)
+_ENV_SECRET_RE = re.compile(
+    r"(ULTRALYTICS_API_KEY\s*=\s*)(['\"]?)([^'\"\s]+)\2", re.I)
+_LOG_LIMIT = 2500
+
+
+def _redact_secrets(text):
+    text = _ENV_SECRET_RE.sub(r"\1\2***\2", text or "")
+    return _SECRET_RE.sub("ul_***", text)
+
+
+class _TrainJob(object):
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.run_id = None
+        self.run_dir = None
+        self.proc = None
+        self.lines = []
+        self.running = False
+        self.done = False
+        self.error = None
+        self.returncode = None
+        self.source_cwd = None
+
+
+_train_job = _TrainJob()
+
+
+def _train_progress(run_dir):
+    path = os.path.join(run_dir or "", "progress.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _train_save_dir(run_dir, progress=None):
+    progress = progress if progress is not None else _train_progress(run_dir)
+    save_dir = progress.get("save_dir")
+    if save_dir and os.path.isdir(save_dir):
+        return save_dir
+    candidate = os.path.join(run_dir, "runs", "train")
+    if os.path.isdir(candidate):
+        return candidate
+    runs = os.path.join(run_dir, "runs")
+    if not os.path.isdir(runs):
+        return None
+    for root, _dirs, files in os.walk(runs):
+        if "results.csv" in files or os.path.isdir(os.path.join(root, "weights")):
+            return root
+    return None
+
+
+def _train_ckpt(run_dir, progress=None):
+    progress = progress if progress is not None else _train_progress(run_dir)
+    save_dir = _train_save_dir(run_dir, progress)
+    best = progress.get("best") or (os.path.join(save_dir, "weights", "best.pt") if save_dir else "")
+    last = progress.get("last") or (os.path.join(save_dir, "weights", "last.pt") if save_dir else "")
+    best = best if best and os.path.isfile(best) else ""
+    last = last if last and os.path.isfile(last) else ""
+    return best, last, save_dir
+
+
+def _train_results(save_dir):
+    if not save_dir:
+        return {}
+    path = os.path.join(save_dir, "results.csv")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, newline="") as f:
+            rows = list(csv.DictReader(f))
+    except Exception:
+        return {}
+    if not rows:
+        return {}
+
+    def lookup(row, names):
+        stripped = { (k or "").strip(): (v or "").strip() for k, v in row.items() }
+        for name in names:
+            if name in stripped and stripped[name] != "":
+                try:
+                    return float(stripped[name])
+                except ValueError:
+                    return None
+        return None
+
+    last = rows[-1]
+    return {
+        "epoch": lookup(last, ("epoch",)),
+        "box_loss": lookup(last, ("train/box_loss",)),
+        "cls_loss": lookup(last, ("train/cls_loss",)),
+        "precision": lookup(last, ("metrics/precision(B)", "metrics/precision")),
+        "recall": lookup(last, ("metrics/recall(B)", "metrics/recall")),
+        "map50": lookup(last, ("metrics/mAP50(B)", "metrics/mAP50")),
+        "map50_95": lookup(last, ("metrics/mAP50-95(B)", "metrics/mAP50-95")),
+        "epochs": len(rows),
+    }
+
+
+def _looks_like_train_script(script):
+    low = (script or "").lower()
+    if "train" not in low:
+        return False
+    return "yolo" in low or "ultralytics" in low
+
+
+def _append_train_line(job, line, replace):
+    line = _redact_secrets(_ANSI_RE.sub("", line).replace("\x00", "")).rstrip()
+    with job.lock:
+        if replace and job.lines:
+            job.lines[-1] = line
+        else:
+            job.lines.append(line)
+            if len(job.lines) > _LOG_LIMIT:
+                job.lines = job.lines[-2000:]
+        run_dir = job.run_dir
+    if run_dir and not replace:
+        try:
+            with open(os.path.join(run_dir, "train.log"), "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+
+def _pump_train_output(proc, job):
+    stream = proc.stdout
+    buf = b""
+    while True:
+        chunk = stream.read(256)
+        if not chunk:
+            break
+        buf += chunk
+        while True:
+            npos = buf.find(b"\n")
+            rpos = buf.find(b"\r")
+            if npos < 0 and rpos < 0:
+                break
+            if npos < 0:
+                pos, kind = rpos, "r"
+            elif rpos < 0:
+                pos, kind = npos, "n"
+            else:
+                pos, kind = (rpos, "r") if rpos < npos else (npos, "n")
+            line = buf[:pos].decode("utf-8", "replace")
+            buf = buf[pos + 1:]
+            if kind == "r" and buf[:1] == b"\n":
+                buf = buf[1:]
+                kind = "n"
+            _append_train_line(job, line, replace=(kind == "r"))
+    if buf:
+        _append_train_line(job, buf.decode("utf-8", "replace"), replace=False)
+
+
+def _watch_train(proc, job):
+    try:
+        _pump_train_output(proc, job)
+    finally:
+        rc = proc.wait()
+        best, last, _save_dir = _train_ckpt(job.run_dir)
+        with job.lock:
+            job.returncode = rc
+            job.running = False
+            job.done = True
+            job.proc = None
+            if rc not in (0, None) and not job.error:
+                job.error = "Training exited with code {}".format(rc)
+            elif rc == 0 and not best and not last:
+                job.error = (
+                    "Training finished but no checkpoint was written. "
+                    "The script must call model.train(...)."
+                )
+
+
+def _stop_train_proc(proc):
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            proc.terminate()
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return
+        time.sleep(0.2)
+    try:
+        if os.name == "nt":
+            proc.kill()
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _train_status_payload(job, offset=0):
+    with job.lock:
+        run_id = job.run_id
+        run_dir = job.run_dir
+        running = job.running
+        done = job.done
+        error = job.error
+        lines = list(job.lines)
+    offset = max(0, int(offset or 0))
+    chunk = lines[offset:]
+    progress = _train_progress(run_dir) if run_dir else {}
+    best, last, save_dir = _train_ckpt(run_dir, progress) if run_dir else ("", "", None)
+    return {
+        "success": True,
+        "run_id": run_id,
+        "run_dir": run_dir,
+        "save_dir": save_dir,
+        "running": running,
+        "done": done,
+        "error": error,
+        "lines": chunk,
+        "next_offset": offset + len(chunk),
+        "progress": progress,
+        "results": _train_results(save_dir),
+        "best_pt": best or None,
+        "last_pt": last or None,
+    }
+
 
 # ---------------------------------------------------------------------------
 #  Flask routes
@@ -1426,7 +1885,10 @@ def start_camera():
     cam = int(data.get("camera", 0))
     if _state.start(cam):
         return jsonify({"success": True})
-    return jsonify({"success": False, "error": "Cannot open camera"})
+    return jsonify({
+        "success": False,
+        "error": _state._start_error or "Cannot open camera",
+    })
 
 
 @blueprint.route("/stop", methods=["POST"])
@@ -1437,35 +1899,21 @@ def stop_camera():
 
 @blueprint.route("/cameras")
 def list_cameras():
-    """
-    List only cameras that can deliver frames, each with tested resolutions.
-    Entry shape: {index, name, resolutions:[{width,height}], default:{width,height}}
-
-    Default: return the last catalog immediately (no device I/O) when one
-    exists. Pass ?discover=1 to look for newly plugged cameras only — cached
-    devices are not re-opened or re-tested.
-    """
-    discover = str(request.args.get("discover") or "").lower() in (
-        "1", "true", "yes",
-    )
-    cached = _catalog_snapshot()
-    if cached and not discover:
-        return jsonify({
-            "success": True,
-            "cameras": cached,
-            "current": _state._camera_index if _state.running else None,
-            "cached": True,
-        })
-
-    skip = _state._camera_index if _state.running else None
-    skip_entry = _state.catalog_entry() if _state.running else None
-    cameras = enumerate_cameras(
-        max_probe=10,
-        skip_index=skip,
-        skip_entry=skip_entry,
-        reuse_cached=True,
-        never_probe=_parse_index_set(request.args.get("skip")),
-    )
+    """Cameras reported by the camera extension. This process does not open them."""
+    try:
+        cameras = camera_list()
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)})
+    if _state.running:
+        with _state.lock:
+            width, height = _state._last_resolution
+        if width > 0 and height > 0:
+            for cam in cameras:
+                if int(cam.get("index", -1)) != _state._camera_index:
+                    continue
+                current = {"width": width, "height": height}
+                cam["resolutions"] = [current]
+                cam["default"] = current
     return jsonify({
         "success": True,
         "cameras": cameras,
@@ -1476,7 +1924,7 @@ def list_cameras():
 
 @blueprint.route("/resolution", methods=["GET", "POST"])
 def resolution():
-    if _state.camera is None or not _state.running:
+    if not _state.running:
         return jsonify({"success": False, "error": "Camera not running"})
     if request.method == "GET":
         with _state.lock:
@@ -1533,10 +1981,195 @@ def mode():
         return jsonify({"success": True, "mode": _state.mode})
     data = request.get_json() or {}
     m = data.get("mode")
-    if m in ("color", "shape"):
+    if m in ("color", "shape", "yolo"):
         _state.mode = m
         return jsonify({"success": True, "mode": m})
     return jsonify({"success": False, "error": "Invalid mode"})
+
+
+@blueprint.route("/model", methods=["GET"])
+def model_status():
+    return jsonify({"success": True, **_state.yolo_status()})
+
+
+@blueprint.route("/load-model", methods=["POST"])
+def load_model():
+    path = None
+    upload = request.files.get("file")
+    if upload and upload.filename:
+        filename = os.path.basename(upload.filename)
+        if not _allowed_ckpt_filename(filename):
+            return jsonify({"success": False, "error": "Need a .pt or .ckpt file"})
+        dest_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_models")
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = os.path.join(dest_dir, filename)
+        upload.save(dest)
+        path = dest
+    else:
+        data = request.get_json(silent=True) or {}
+        path = (data.get("path") or "").strip() or None
+
+    if not path:
+        return jsonify({"success": False, "error": "Choose a local YOLO26n checkpoint"})
+    try:
+        info = _state.load_yolo(path)
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)})
+    return jsonify({"success": True, **info})
+
+
+@blueprint.route("/unload-model", methods=["POST"])
+def unload_model():
+    _state.unload_yolo()
+    return jsonify({"success": True})
+
+
+@blueprint.route("/yolo-conf", methods=["GET", "POST"])
+def yolo_conf():
+    if request.method == "GET":
+        return jsonify({"success": True, "conf": _state.yolo_status()["conf"]})
+    data = request.get_json(silent=True) or {}
+    try:
+        conf = _state.set_yolo_conf(data.get("conf"))
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)})
+    return jsonify({"success": True, "conf": conf})
+
+
+@blueprint.route("/train/start", methods=["POST"])
+def train_start():
+    with _train_job.lock:
+        if _train_job.running:
+            return jsonify({
+                "success": False,
+                "error": "Training is already running",
+                "run_id": _train_job.run_id,
+            })
+
+    data = request.get_json(silent=True) or {}
+    script = (data.get("script") or "").replace("\r\n", "\n")
+    if script.startswith("\ufeff"):
+        script = script[1:]
+    script = script.strip()
+    if not script:
+        return jsonify({"success": False,
+                        "error": "Paste a training script from the YOLO docs"})
+    if len(script) > 1000000:
+        return jsonify({"success": False, "error": "Script is too large"})
+    if not _looks_like_train_script(script):
+        return jsonify({
+            "success": False,
+            "error": "This does not look like a YOLO training script. "
+                     "Paste the Python example from the Ultralytics Train page.",
+        })
+
+    source_cwd = (data.get("cwd") or "").strip() or None
+    if source_cwd:
+        source_cwd = os.path.abspath(source_cwd)
+        if not os.path.isdir(source_cwd):
+            return jsonify({"success": False,
+                            "error": "Script folder not found: " + source_cwd})
+
+    run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
+    run_dir = os.path.join(_TRAIN_ROOT, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+    script_path = os.path.join(run_dir, "script.py")
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(script)
+        f.write("\n")
+
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    cmd = [sys.executable, "-u", _TRAIN_RUNNER, run_dir]
+    if source_cwd:
+        cmd.append(source_cwd)
+
+    popen_kwargs = dict(
+        cwd=run_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        bufsize=0,
+    )
+    if os.name == "nt":
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        if flags:
+            popen_kwargs["creationflags"] = flags
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    try:
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)})
+
+    with _train_job.lock:
+        _train_job.run_id = run_id
+        _train_job.run_dir = run_dir
+        _train_job.proc = proc
+        _train_job.lines = ["Started training run " + run_id]
+        _train_job.running = True
+        _train_job.done = False
+        _train_job.error = None
+        _train_job.returncode = None
+        _train_job.source_cwd = source_cwd
+
+    try:
+        with open(os.path.join(run_dir, "train.log"), "w", encoding="utf-8") as f:
+            f.write("Started training run " + run_id + "\n")
+    except Exception:
+        pass
+
+    threading.Thread(target=_watch_train, args=(proc, _train_job), daemon=True).start()
+    payload = _train_status_payload(_train_job, offset=0)
+    payload["log_reset"] = True
+    return jsonify(payload)
+
+
+@blueprint.route("/train/status")
+def train_status():
+    try:
+        offset = int(request.args.get("offset") or 0)
+    except (TypeError, ValueError):
+        offset = 0
+    return jsonify(_train_status_payload(_train_job, offset=offset))
+
+
+@blueprint.route("/train/stop", methods=["POST"])
+def train_stop():
+    with _train_job.lock:
+        proc = _train_job.proc
+        running = _train_job.running
+        if running:
+            _train_job.error = "Stopped"
+    if running:
+        _stop_train_proc(proc)
+        _append_train_line(_train_job, "Training stopped.", replace=False)
+    payload = _train_status_payload(_train_job, offset=0)
+    payload["lines"] = []
+    return jsonify(payload)
+
+
+@blueprint.route("/train/load-best", methods=["POST"])
+def train_load_best():
+    with _train_job.lock:
+        if _train_job.running:
+            return jsonify({"success": False,
+                            "error": "Wait for training to finish before loading"})
+        run_dir = _train_job.run_dir
+    if not run_dir:
+        return jsonify({"success": False, "error": "No training run yet"})
+    best, last, _save_dir = _train_ckpt(run_dir)
+    path = best or last
+    if not path:
+        return jsonify({"success": False,
+                        "error": "No best.pt (or last.pt) in this run"})
+    try:
+        info = _state.load_yolo(path)
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)})
+    return jsonify({"success": True, **info})
 
 
 @blueprint.route("/learn", methods=["POST"])
@@ -1544,6 +2177,9 @@ def learn():
     data = request.get_json() or {}
     name = (data.get("name") or "").strip() or None
 
+    if _state.mode == "yolo":
+        return jsonify({"success": False,
+                        "error": "Switch to Color or Shape to learn items"})
     if _state.mode == "color":
         item = _state.learn_color(name)
     else:

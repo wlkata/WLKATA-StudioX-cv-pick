@@ -1,3 +1,2 @@
-opencv-python>=4.8
-numpy
-pygrabber>=0.1; platform_system=="Windows"
+# opencv-python, numpy, and pygrabber are provided by the camera extension.
+ultralytics>=8.4.35

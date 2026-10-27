@@ -7,11 +7,20 @@
   var nameInput   = document.getElementById('cvpick-name');
   var learnBtn    = document.getElementById('cvpick-learn-btn');
   var clearBtn    = document.getElementById('cvpick-clear-btn');
+  var modelFileInput = document.getElementById('cvpick-model-file');
+  var modelBrowseBtn = document.getElementById('cvpick-model-browse');
+  var modelFilename  = document.getElementById('cvpick-model-filename');
+  var loadBtn     = document.getElementById('cvpick-load-btn');
+  var unloadBtn   = document.getElementById('cvpick-unload-btn');
+  var trainBtn    = document.getElementById('cvpick-train-btn');
+  var yoloConfInput = document.getElementById('cvpick-yolo-conf');
+  var yoloSettings = document.getElementById('cvpick-yolo-settings');
   var learnedList = document.getElementById('cvpick-learned-list');
   var colorBtn    = document.getElementById('cvpick-mode-color');
   var shapeBtn    = document.getElementById('cvpick-mode-shape');
   var learnPhBtn  = document.getElementById('cvpick-phase-learn');
   var detectPhBtn = document.getElementById('cvpick-phase-detect');
+  var modelPhBtn  = document.getElementById('cvpick-phase-model');
   var learnControls = document.getElementById('cvpick-learn-controls');
   var cameraSelect  = document.getElementById('cvpick-camera-select');
   var cameraStartBtn = document.getElementById('cvpick-camera-start');
@@ -45,8 +54,11 @@
   var currentPhase = 'learning';
   var LIFT_MIN = 1;
   var LIFT_MAX = 100;
+  var CONF_MIN = 0.05;
+  var CONF_MAX = 0.95;
   var liftHeight = 10;
   var scanEach = false;
+  var yoloConf = 0.25;
   var pickRunning = false;
 
   function clampLift(v) {
@@ -59,7 +71,8 @@
   function savePickSettings() {
     ExtensionAPI.setData('cv-pick', 'pickSettings', {
       liftHeight: liftHeight,
-      scanEach: scanEach
+      scanEach: scanEach,
+      yoloConf: yoloConf
     });
   }
 
@@ -87,10 +100,23 @@
         if (lh != null) liftHeight = lh;
       }
       if (s.scanEach) scanEach = true;
+      if (s.yoloConf != null) {
+        var yc = parseFloat(s.yoloConf);
+        if (isFinite(yc)) {
+          if (yc < CONF_MIN) yc = CONF_MIN;
+          if (yc > CONF_MAX) yc = CONF_MAX;
+          yoloConf = yc;
+        }
+      }
     }
     if (liftInput) liftInput.value = String(liftHeight);
+    if (yoloConfInput) yoloConfInput.value = String(yoloConf);
     if (scanOnceBtn) scanOnceBtn.classList.toggle('active', !scanEach);
     if (scanEachBtn) scanEachBtn.classList.toggle('active', scanEach);
+    ExtensionAPI.fetch('cv-pick', '/yolo-conf', {
+      method: 'POST',
+      body: JSON.stringify({ conf: yoloConf })
+    }).catch(function () {});
   })();
 
   if (liftInput) {
@@ -116,6 +142,39 @@
   }
   if (scanEachBtn) {
     scanEachBtn.addEventListener('click', function () { setScanEach(true); });
+  }
+
+  function applyYoloConf(raw, writeInput) {
+    if (!isFinite(raw)) return false;
+    if (raw < CONF_MIN) raw = CONF_MIN;
+    if (raw > CONF_MAX) raw = CONF_MAX;
+    yoloConf = raw;
+    if (writeInput && yoloConfInput) yoloConfInput.value = String(raw);
+    savePickSettings();
+    ExtensionAPI.fetch('cv-pick', '/yolo-conf', {
+      method: 'POST',
+      body: JSON.stringify({ conf: yoloConf })
+    }).catch(function () {});
+    return true;
+  }
+
+  if (yoloConfInput) {
+    yoloConfInput.addEventListener('input', function () {
+      var raw = parseFloat(this.value);
+      if (!isFinite(raw)) return;
+      if (raw > CONF_MAX) {
+        this.value = String(CONF_MAX);
+        applyYoloConf(CONF_MAX, false);
+      } else if (raw >= CONF_MIN) {
+        applyYoloConf(raw, false);
+      }
+    });
+    yoloConfInput.addEventListener('change', function () {
+      var raw = parseFloat(this.value);
+      if (!applyYoloConf(raw, true)) {
+        this.value = String(yoloConf);
+      }
+    });
   }
 
   // ---- robot jog controls -----------------------------------------------
@@ -984,14 +1043,29 @@
 
   // ---- mode toggle ------------------------------------------------------
 
-  function setMode(mode) {
-    currentMode = mode;
-    colorBtn.classList.toggle('active', mode === 'color');
-    shapeBtn.classList.toggle('active', mode === 'shape');
+  function listMode() {
+    return currentPhase === 'yolo' ? 'yolo' : currentMode;
+  }
+
+  function syncBackendMode() {
+    var mode = listMode();
+    var phase = currentPhase === 'yolo' ? 'inference' : currentPhase;
     ExtensionAPI.fetch('cv-pick', '/mode', {
       method: 'POST',
       body: JSON.stringify({ mode: mode })
     });
+    ExtensionAPI.fetch('cv-pick', '/phase', {
+      method: 'POST',
+      body: JSON.stringify({ phase: phase })
+    });
+  }
+
+  function setMode(mode) {
+    if (currentPhase === 'yolo') return;
+    currentMode = mode;
+    colorBtn.classList.toggle('active', mode === 'color');
+    shapeBtn.classList.toggle('active', mode === 'shape');
+    syncBackendMode();
     refreshLearned();
     refreshPickTargets();
   }
@@ -999,28 +1073,37 @@
   colorBtn.addEventListener('click', function () { setMode('color'); });
   shapeBtn.addEventListener('click', function () { setMode('shape'); });
 
-  // ---- phase toggle (learning / inference) ------------------------------
+  // ---- phase toggle (Learn / Detect / Model) ----------------------------
 
   function setPhase(phase) {
     currentPhase = phase;
     learnPhBtn.classList.toggle('active', phase === 'learning');
     detectPhBtn.classList.toggle('active', phase === 'inference');
-    learnControls.style.display = phase === 'learning' ? '' : 'none';
-    ExtensionAPI.fetch('cv-pick', '/phase', {
-      method: 'POST',
-      body: JSON.stringify({ phase: phase })
-    });
+    if (modelPhBtn) modelPhBtn.classList.toggle('active', phase === 'yolo');
+    colorBtn.disabled = phase === 'yolo';
+    shapeBtn.disabled = phase === 'yolo';
+    if (yoloSettings) yoloSettings.hidden = phase !== 'yolo';
+    if (learnControls) {
+      learnControls.style.display = phase === 'learning' ? '' : 'none';
+    }
+    syncBackendMode();
     if (phase === 'learning') {
       calibState.pixelA = null;
       calibState.pixelB = null;
       calibState.pixelC = null;
       updateCalibUI();
+    } else {
+      updateCalibDetectBtn();
     }
-    updateCalibDetectBtn();
+    refreshLearned();
+    refreshPickTargets();
   }
 
   learnPhBtn.addEventListener('click', function () { setPhase('learning'); });
   detectPhBtn.addEventListener('click', function () { setPhase('inference'); });
+  if (modelPhBtn) {
+    modelPhBtn.addEventListener('click', function () { setPhase('yolo'); });
+  }
 
   // ---- learn ------------------------------------------------------------
 
@@ -1048,32 +1131,396 @@
     });
   });
 
+  // ---- load YOLO26n checkpoint ------------------------------------------
+
+  var selectedModelFile = null;
+
+  function setModelFilename(text) {
+    var label = text || 'No file';
+    if (modelFilename) {
+      modelFilename.textContent = label;
+      modelFilename.title = label;
+    }
+  }
+
+  function selectedCkptPath() {
+    if (!selectedModelFile) return '';
+    return selectedModelFile.path || '';
+  }
+
+  if (modelBrowseBtn && modelFileInput) {
+    modelBrowseBtn.addEventListener('click', function () {
+      modelFileInput.click();
+    });
+    modelFileInput.addEventListener('change', function () {
+      selectedModelFile = this.files && this.files[0] ? this.files[0] : null;
+      setModelFilename(selectedModelFile ? selectedModelFile.name : '');
+      if (loadBtn) loadBtn.disabled = !selectedModelFile;
+    });
+  }
+
+  function loadModel() {
+    if (!selectedModelFile) {
+      ExtensionAPI.showNotification('Choose a YOLO26n .pt checkpoint', 'error');
+      return;
+    }
+    loadBtn.disabled = true;
+    loadBtn.textContent = 'Loading\u2026';
+
+    var path = selectedCkptPath();
+    var req;
+    if (path) {
+      req = ExtensionAPI.fetch('cv-pick', '/load-model', {
+        method: 'POST',
+        body: JSON.stringify({ path: path })
+      });
+    } else {
+      var form = new FormData();
+      form.append('file', selectedModelFile);
+      req = fetch(ExtensionAPI.getServerUrl() + '/ext/cv-pick/load-model', {
+        method: 'POST',
+        body: form
+      }).then(function (resp) { return resp.json(); });
+    }
+
+    req.then(function (data) {
+      loadBtn.textContent = 'Load';
+      loadBtn.disabled = !selectedModelFile;
+      if (data.success) {
+        setModelFilename(data.filename || selectedModelFile.name);
+        refreshLearned();
+        refreshPickTargets();
+        ExtensionAPI.showNotification(
+          'Loaded YOLO26n (' + (data.classes || 0) + ' classes)',
+          'info');
+      } else {
+        ExtensionAPI.showNotification(data.error || 'Failed to load checkpoint', 'error');
+      }
+    }).catch(function () {
+      loadBtn.textContent = 'Load';
+      loadBtn.disabled = !selectedModelFile;
+      ExtensionAPI.showNotification('Failed to load checkpoint', 'error');
+    });
+  }
+
+  if (loadBtn) loadBtn.addEventListener('click', loadModel);
+
+  function refreshModelStatus() {
+    ExtensionAPI.fetch('cv-pick', '/model').then(function (data) {
+      if (data.success && data.loaded) {
+        setModelFilename(data.filename || 'YOLO26n loaded');
+      }
+    }).catch(function () {});
+  }
+
   // ---- clear all --------------------------------------------------------
 
   clearBtn.addEventListener('click', function () {
-    ExtensionAPI.fetch('cv-pick', '/clear', { method: 'POST' })
-      .then(refreshLearned);
+    ExtensionAPI.fetch('cv-pick', '/clear', { method: 'POST' }).then(function () {
+      refreshLearned();
+      refreshPickTargets();
+    });
   });
+
+  if (unloadBtn) {
+    unloadBtn.addEventListener('click', function () {
+      ExtensionAPI.fetch('cv-pick', '/unload-model', { method: 'POST' }).then(function (data) {
+        if (!data.success) {
+          ExtensionAPI.showNotification(data.error || 'Unload failed', 'error');
+          return;
+        }
+        if (!selectedModelFile) setModelFilename('');
+        refreshLearned();
+        refreshPickTargets();
+        ExtensionAPI.showNotification('YOLO model unloaded', 'info');
+      });
+    });
+  }
+
+  (function setupTrainWindow() {
+    var overlay = document.getElementById('cvpick-train-overlay');
+    var closeBtn = document.getElementById('cvpick-train-close');
+    var scriptEl = document.getElementById('cvpick-train-script');
+    var fileEl = document.getElementById('cvpick-train-file');
+    var pickBtn = document.getElementById('cvpick-train-pick');
+    var scriptName = document.getElementById('cvpick-train-script-name');
+    var startBtn = document.getElementById('cvpick-train-start');
+    var stopBtn = document.getElementById('cvpick-train-stop');
+    var loadBtn = document.getElementById('cvpick-train-load');
+    var statusEl = document.getElementById('cvpick-train-status');
+    var logEl = document.getElementById('cvpick-train-log');
+    var runDirEl = document.getElementById('cvpick-train-run-dir');
+    var epochEl = document.getElementById('cvpick-train-epoch');
+    var boxEl = document.getElementById('cvpick-train-box');
+    var map50El = document.getElementById('cvpick-train-map50');
+    var mapEl = document.getElementById('cvpick-train-map');
+    if (!overlay || !trainBtn) return;
+
+    var selectedFile = null;
+    var sourceCwd = null;
+    var pollTimer = null;
+    var logOffset = 0;
+    var runId = null;
+    var stickToBottom = true;
+    var opened = false;
+
+    function setStatus(text, kind) {
+      if (!statusEl) return;
+      statusEl.textContent = text;
+      statusEl.className = 'cvpick-train-status' + (kind ? ' ' + kind : '');
+    }
+
+    function fmt(v, digits) {
+      if (v == null || v === '' || !isFinite(Number(v))) return '\u2014';
+      return Number(v).toFixed(digits);
+    }
+
+    function dirname(p) {
+      if (!p) return null;
+      var i = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+      return i > 0 ? p.slice(0, i) : null;
+    }
+
+    function metric(obj, keys) {
+      if (!obj) return null;
+      for (var i = 0; i < keys.length; i++) {
+        if (obj[keys[i]] != null && obj[keys[i]] !== '') return obj[keys[i]];
+      }
+      return null;
+    }
+
+    function closeTrainWindow() {
+      overlay.hidden = true;
+    }
+
+    function openTrainWindow() {
+      if (overlay.parentNode !== document.body) {
+        document.body.appendChild(overlay);
+      }
+      overlay.hidden = false;
+      if (!opened) {
+        opened = true;
+        logOffset = 0;
+        if (logEl) logEl.textContent = '';
+        ExtensionAPI.fetch('cv-pick', '/train/status?offset=0').then(function (data) {
+          if (data && (data.running || data.done || (data.lines && data.lines.length))) {
+            if (logEl) logEl.textContent = '';
+          }
+          applyStatus(data);
+          if (data && (data.running || (data.lines && data.lines.length))) startPolling();
+        }).catch(function () {});
+      }
+    }
+
+    if (logEl) {
+      logEl.addEventListener('scroll', function () {
+        stickToBottom = (logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight) < 24;
+      });
+    }
+
+    trainBtn.addEventListener('click', openTrainWindow);
+    if (closeBtn) closeBtn.addEventListener('click', closeTrainWindow);
+    overlay.addEventListener('click', function (e) {
+      if (e.target === overlay) closeTrainWindow();
+    });
+
+    if (pickBtn && fileEl) {
+      pickBtn.addEventListener('click', function () { fileEl.click(); });
+      fileEl.addEventListener('change', function () {
+        selectedFile = this.files && this.files[0] ? this.files[0] : null;
+        sourceCwd = selectedFile && selectedFile.path ? dirname(selectedFile.path) : null;
+        if (!selectedFile) {
+          if (scriptName) scriptName.textContent = 'No file — paste a command below';
+          return;
+        }
+        if (scriptName) {
+          scriptName.textContent = selectedFile.name + (sourceCwd ? '  (' + sourceCwd + ')' : '');
+        }
+        var reader = new FileReader();
+        reader.onload = function () {
+          if (scriptEl) scriptEl.value = String(reader.result || '');
+        };
+        reader.readAsText(selectedFile);
+      });
+    }
+
+    function applyStatus(data) {
+      if (!data || !data.success) return;
+      if (data.run_id) runId = data.run_id;
+      if (data.run_dir && runDirEl) runDirEl.textContent = data.run_dir;
+      if (data.log_reset && logEl) {
+        logEl.textContent = '';
+        logOffset = 0;
+      }
+      if (data.lines && data.lines.length && logEl) {
+        var chunk = data.lines.join('\n');
+        logEl.textContent = logEl.textContent ? logEl.textContent + '\n' + chunk : chunk;
+        logOffset = data.next_offset != null ? data.next_offset : logOffset + data.lines.length;
+        if (stickToBottom) logEl.scrollTop = logEl.scrollHeight;
+      } else if (data.next_offset != null) {
+        logOffset = data.next_offset;
+      }
+
+      var p = data.progress || {};
+      var csv = data.results || {};
+      var epochs = p.epochs || csv.epochs || '';
+      var epoch = p.epoch != null ? p.epoch : csv.epoch;
+      if (epochEl) {
+        epochEl.textContent = epoch != null && epoch !== ''
+          ? (epochs ? epoch + ' / ' + epochs : String(epoch))
+          : '\u2014';
+      }
+      if (boxEl) {
+        boxEl.textContent = fmt(metric(csv, ['box_loss']) || metric(p.metrics, ['train/box_loss']), 4);
+      }
+      if (map50El) {
+        map50El.textContent = fmt(
+          metric(p.metrics, ['metrics/mAP50(B)', 'metrics/mAP50']) || csv.map50, 4);
+      }
+      if (mapEl) {
+        mapEl.textContent = fmt(
+          metric(p.metrics, ['metrics/mAP50-95(B)', 'metrics/mAP50-95']) || csv.map50_95, 4);
+      }
+
+      var canLoad = !!(data.best_pt || data.last_pt);
+      if (loadBtn) loadBtn.disabled = !canLoad || !!data.running;
+      if (stopBtn) stopBtn.disabled = !data.running;
+      if (startBtn) startBtn.disabled = !!data.running;
+
+      if (data.running) {
+        setStatus('Training\u2026', 'running');
+      } else if (data.error) {
+        setStatus(data.error, 'error');
+      } else if (data.done && canLoad) {
+        setStatus('Complete \u2014 best checkpoint ready', 'done');
+      } else if (data.done) {
+        setStatus('Finished (no checkpoint written)', 'error');
+      }
+    }
+
+    function poll() {
+      var path = '/train/status?offset=' + encodeURIComponent(String(logOffset));
+      if (runId) path += '&run_id=' + encodeURIComponent(runId);
+      ExtensionAPI.fetch('cv-pick', path).then(function (data) {
+        applyStatus(data);
+        if (data && data.running) {
+          pollTimer = setTimeout(poll, 800);
+        } else if (data && data.success === false) {
+          pollTimer = setTimeout(poll, 1500);
+        } else {
+          pollTimer = null;
+        }
+      }).catch(function () {
+        pollTimer = setTimeout(poll, 1500);
+      });
+    }
+
+    function startPolling() {
+      if (pollTimer) return;
+      poll();
+    }
+
+    if (startBtn) {
+      startBtn.addEventListener('click', function () {
+        var script = (scriptEl && scriptEl.value || '').replace(/^\uFEFF/, '').trim();
+        if (!script) {
+          setStatus('Paste a training command from Ultralytics Platform or the YOLO docs', 'error');
+          return;
+        }
+        startBtn.disabled = true;
+        setStatus('Starting\u2026', 'running');
+        if (logEl) logEl.textContent = '';
+        logOffset = 0;
+        ExtensionAPI.fetch('cv-pick', '/train/start', {
+          method: 'POST',
+          body: JSON.stringify({
+            script: script,
+            cwd: sourceCwd || undefined,
+            filename: selectedFile ? selectedFile.name : undefined
+          })
+        }).then(function (data) {
+          if (!data.success) {
+            startBtn.disabled = false;
+            setStatus(data.error || 'Could not start training', 'error');
+            return;
+          }
+          runId = data.run_id;
+          applyStatus(data);
+          startPolling();
+        }).catch(function () {
+          startBtn.disabled = false;
+          setStatus('Could not start training', 'error');
+        });
+      });
+    }
+
+    if (stopBtn) {
+      stopBtn.addEventListener('click', function () {
+        stopBtn.disabled = true;
+        ExtensionAPI.fetch('cv-pick', '/train/stop', {
+          method: 'POST',
+          body: JSON.stringify({ run_id: runId })
+        }).then(function (data) {
+          applyStatus(data);
+          startPolling();
+        }).catch(function () {
+          stopBtn.disabled = false;
+        });
+      });
+    }
+
+    if (loadBtn) {
+      loadBtn.addEventListener('click', function () {
+        loadBtn.disabled = true;
+        ExtensionAPI.fetch('cv-pick', '/train/load-best', {
+          method: 'POST',
+          body: JSON.stringify({ run_id: runId })
+        }).then(function (data) {
+          if (!data.success) {
+            loadBtn.disabled = false;
+            setStatus(data.error || 'Failed to load checkpoint', 'error');
+            return;
+          }
+          setStatus('Loaded ' + (data.filename || 'best.pt') +
+            ' (' + (data.classes || 0) + ' classes)', 'done');
+          if (data.filename) setModelFilename(data.filename);
+          refreshLearned();
+          refreshPickTargets();
+          ExtensionAPI.showNotification(
+            'Loaded YOLO26n (' + (data.classes || 0) + ' classes)',
+            'info');
+        }).catch(function () {
+          loadBtn.disabled = false;
+          setStatus('Failed to load checkpoint', 'error');
+        });
+      });
+    }
+  })();
 
   // ---- learned-items list -----------------------------------------------
 
   function refreshLearned() {
-    var kind = currentMode === 'shape' ? 'shapes' : 'colors';
     var titleEl = document.getElementById('cvpick-learned-title');
-    if (titleEl) {
-      titleEl.textContent = currentMode === 'shape' ? 'Learned Shapes' : 'Learned Colors';
+    var emptyMsg;
+    if (listMode() === 'yolo') {
+      if (titleEl) titleEl.textContent = 'YOLO Classes';
+      emptyMsg = 'Load a YOLO26n checkpoint in Settings to detect objects.';
+    } else if (currentMode === 'shape') {
+      if (titleEl) titleEl.textContent = 'Learned Shapes';
+      emptyMsg = 'No shapes learned yet. Place an object in the zone and click Learn.';
+    } else {
+      if (titleEl) titleEl.textContent = 'Learned Colors';
+      emptyMsg = 'No colors learned yet. Place an object in the zone and click Learn.';
     }
 
     ExtensionAPI.fetch('cv-pick', '/learned').then(function (data) {
       var items = (data.success && data.items) ? data.items : [];
       var filtered = items.filter(function (item) {
-        return item.mode === currentMode;
+        return item.mode === listMode();
       });
 
       if (filtered.length === 0) {
-        learnedList.innerHTML =
-          '<p class="cvpick-empty">No ' + kind + ' learned yet. '
-          + 'Place an object in the zone and click Learn.</p>';
+        learnedList.innerHTML = '<p class="cvpick-empty">' + emptyMsg + '</p>';
         return;
       }
 
@@ -1115,6 +1562,7 @@
     pixelA: null, pixelB: null, pixelC: null,   // [px, py]
     robotA: null, robotB: null, robotC: null,   // {x, y, z}
   };
+  var isCalibrated = false;
 
   function fmtPx(pt) {
     return '(' + pt[0] + ', ' + pt[1] + ') px';
@@ -1171,11 +1619,11 @@
   }
 
   function updateCalibDetectBtn() {
-    var inDetect = currentPhase === 'inference';
+    var inDetect = currentPhase === 'inference' || currentPhase === 'yolo';
     calibDetectBtn.disabled = !inDetect || pickRunning;
     calibDetectBtn.title = inDetect
       ? 'Detect 3 objects in the zone as calibration markers'
-      : 'Switch to Detect mode to detect markers';
+      : 'Switch to Detect or Model to detect markers';
   }
 
   function saveCalibPoses() {
@@ -1197,16 +1645,18 @@
     }
     ExtensionAPI.fetch('cv-pick', '/calibration').then(function (data) {
       if (data.success && data.calibration) {
+        isCalibrated = true;
         calibStatus.textContent = 'Calibrated';
         calibStatus.classList.add('calibrated');
+        updatePickUI();
       }
     }).catch(function () {});
   }
 
   // Detect markers — pick 3 largest detections (Detect mode only)
   calibDetectBtn.addEventListener('click', function () {
-    if (currentPhase !== 'inference') {
-      ExtensionAPI.showNotification('Switch to Detect mode to detect markers', 'error');
+    if (currentPhase !== 'inference' && currentPhase !== 'yolo') {
+      ExtensionAPI.showNotification('Switch to Detect or Model to detect markers', 'error');
       return;
     }
     calibDetectBtn.disabled = true;
@@ -1214,7 +1664,7 @@
     ExtensionAPI.fetch('cv-pick', '/detections').then(function (data) {
       calibDetectBtn.textContent = 'Detect Markers';
       updateCalibDetectBtn();
-      if (currentPhase !== 'inference') return;
+      if (currentPhase !== 'inference' && currentPhase !== 'yolo') return;
       if (!data.success || !data.detections || data.detections.length < 3) {
         ExtensionAPI.showNotification(
           'Need at least 3 detected objects. Learn an item, switch to Detect, and place 3 markers in an L-shape.',
@@ -1239,59 +1689,34 @@
     });
   });
 
-  // Record robot position for point A
-  calibRecordA.addEventListener('click', function () {
-    if (!requirePort()) return;
-    ExtensionAPI.getRobotStatus(selectedPort).then(function (status) {
-      if (!status.success) {
-        ExtensionAPI.showNotification(status.error || 'Cannot read robot position', 'error');
-        return;
-      }
-      calibState.robotA = {
-        x: status.coordinates.X,
-        y: status.coordinates.Y,
-        z: status.coordinates.Z
-      };
-      saveCalibPoses();
-      updateCalibUI();
-    });
-  });
+  // Cached pose from the reader. Does not send another ? to the arm.
+  function readCachedRobotPose() {
+    return fetch(ExtensionAPI.getServerUrl() + '/cmd/last-status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ port: selectedPort })
+    }).then(function (r) { return r.json(); });
+  }
 
-  // Record robot position for point B
-  calibRecordB.addEventListener('click', function () {
+  function recordCalibRobot(slot) {
     if (!requirePort()) return;
-    ExtensionAPI.getRobotStatus(selectedPort).then(function (status) {
-      if (!status.success) {
-        ExtensionAPI.showNotification(status.error || 'Cannot read robot position', 'error');
+    readCachedRobotPose().then(function (status) {
+      var coords = status && status.coordinates;
+      if (!status || !status.success || !coords) {
+        ExtensionAPI.showNotification((status && status.error) || 'No robot position yet', 'error');
         return;
       }
-      calibState.robotB = {
-        x: status.coordinates.X,
-        y: status.coordinates.Y,
-        z: status.coordinates.Z
-      };
+      calibState[slot] = { x: coords.X, y: coords.Y, z: coords.Z };
       saveCalibPoses();
       updateCalibUI();
+    }).catch(function () {
+      ExtensionAPI.showNotification('Cannot read robot position', 'error');
     });
-  });
+  }
 
-  // Record robot position for point C
-  calibRecordC.addEventListener('click', function () {
-    if (!requirePort()) return;
-    ExtensionAPI.getRobotStatus(selectedPort).then(function (status) {
-      if (!status.success) {
-        ExtensionAPI.showNotification(status.error || 'Cannot read robot position', 'error');
-        return;
-      }
-      calibState.robotC = {
-        x: status.coordinates.X,
-        y: status.coordinates.Y,
-        z: status.coordinates.Z
-      };
-      saveCalibPoses();
-      updateCalibUI();
-    });
-  });
+  calibRecordA.addEventListener('click', function () { recordCalibRobot('robotA'); });
+  calibRecordB.addEventListener('click', function () { recordCalibRobot('robotB'); });
+  calibRecordC.addEventListener('click', function () { recordCalibRobot('robotC'); });
 
   function gotoCalibPose(pos) {
     if (!requirePort()) return;
@@ -1325,6 +1750,7 @@
       })
     }).then(function (data) {
       if (data.success) {
+        isCalibrated = true;
         calibStatus.textContent = 'Calibrated';
         calibStatus.classList.add('calibrated');
         calibState.pixelA = null;
@@ -1332,6 +1758,7 @@
         calibState.pixelC = null;
         saveCalibPoses();
         updateCalibUI();
+        updatePickUI();
         ExtensionAPI.showNotification('Calibration saved! Z=' + avgZ.toFixed(1), 'info');
       } else {
         ExtensionAPI.showNotification(data.error || 'Calibration failed', 'error');
@@ -1356,12 +1783,14 @@
 
   function updatePickUI() {
     dropPosEl.textContent = dropPosition ? fmtRobot(dropPosition) : '\u2014';
-    pickAllBtn.disabled = !dropPosition || pickRunning;
+    var canPick = !!dropPosition && isCalibrated && !pickRunning;
+    pickAllBtn.disabled = !canPick;
     if (pickOneBtn) {
-      pickOneBtn.disabled = !dropPosition || pickRunning || !pickSelect.value;
+      pickOneBtn.disabled = !canPick || !pickSelect.value;
     }
-    if (pickSelect) pickSelect.disabled = pickRunning;
+    if (pickSelect) pickSelect.disabled = pickRunning || !isCalibrated;
     if (liftInput) liftInput.disabled = pickRunning;
+    if (yoloConfInput) yoloConfInput.disabled = pickRunning;
     if (scanOnceBtn) scanOnceBtn.disabled = pickRunning;
     if (scanEachBtn) scanEachBtn.disabled = pickRunning;
     updateCalibUI();
@@ -1380,7 +1809,7 @@
 
       var names = [];
       learned.forEach(function (item) {
-        if (item.mode !== currentMode) return;
+        if (item.mode !== listMode()) return;
         if (item.name && names.indexOf(item.name) === -1) names.push(item.name);
       });
 
@@ -1389,6 +1818,13 @@
         var n = d.name;
         if (!n) return;
         counts[n] = (counts[n] || 0) + 1;
+      });
+
+      names.sort(function (a, b) {
+        var ca = counts[a] || 0;
+        var cb = counts[b] || 0;
+        if (cb !== ca) return cb - ca;
+        return a < b ? -1 : a > b ? 1 : 0;
       });
 
       pickSelect.innerHTML = '<option value="">-- select group --</option>';
@@ -1685,4 +2121,5 @@
 
   updatePickUI();
   refreshPickTargets();
+  refreshModelStatus();
 })();
